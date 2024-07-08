@@ -7,6 +7,7 @@ import (
 	"github.com/golang/protobuf/proto"
 )
 
+// KeyWithCF 通过向键添加前缀来模拟列族
 func KeyWithCF(cf string, key []byte) []byte {
 	return append([]byte(cf+"_"), key...)
 }

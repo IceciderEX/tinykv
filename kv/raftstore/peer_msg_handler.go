@@ -38,22 +38,26 @@ func newPeerMsgHandler(peer *peer, ctx *GlobalContext) *peerMsgHandler {
 	}
 }
 
+// HandleRaftReady should get the ready from Raft module and do corresponding actions like persisting log entries,
+// applying committed entries and sending raft messages to other peers through the network
 func (d *peerMsgHandler) HandleRaftReady() {
 	if d.stopped {
 		return
 	}
 	// Your Code Here (2B).
+
 }
 
+// HandleMsg processes all the messages received from raftCh
 func (d *peerMsgHandler) HandleMsg(msg message.Msg) {
 	switch msg.Type {
 	case message.MsgTypeRaftMessage:
-		raftMsg := msg.Data.(*rspb.RaftMessage)
+		raftMsg := msg.Data.(*rspb.RaftMessage) // the message transported between Raft peers.
 		if err := d.onRaftMsg(raftMsg); err != nil {
 			log.Errorf("%s handle raft message error %v", d.Tag, err)
 		}
 	case message.MsgTypeRaftCmd:
-		raftCMD := msg.Data.(*message.MsgRaftCmd)
+		raftCMD := msg.Data.(*message.MsgRaftCmd) // it wraps the request from clients
 		d.proposeRaftCommand(raftCMD.Request, raftCMD.Callback)
 	case message.MsgTypeTick:
 		d.onTick()
@@ -114,6 +118,7 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		return
 	}
 	// Your Code Here (2B).
+
 }
 
 func (d *peerMsgHandler) onTick() {
@@ -223,9 +228,9 @@ func (d *peerMsgHandler) validateRaftMessage(msg *rspb.RaftMessage) bool {
 	return true
 }
 
-/// Checks if the message is sent to the correct peer.
-///
-/// Returns true means that the message can be dropped silently.
+// / Checks if the message is sent to the correct peer.
+// /
+// / Returns true means that the message can be dropped silently.
 func (d *peerMsgHandler) checkMessage(msg *rspb.RaftMessage) bool {
 	fromEpoch := msg.GetRegionEpoch()
 	isVoteMsg := util.IsVoteMessage(msg.Message)

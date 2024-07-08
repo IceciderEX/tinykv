@@ -69,6 +69,7 @@ func nodes(r *Raft) []uint64 {
 	return nodes
 }
 
+// diffu 比较两个字符串 a 和 b 的内容差异，并返回这些差异的结果
 func diffu(a, b string) string {
 	if a == b {
 		return ""

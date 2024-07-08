@@ -41,9 +41,11 @@ message Snapshot {
 enum MessageType {
     // 'MessageType_MsgHup' is a local message used for election. If an election timeout happened,
     // the node should pass 'MessageType_MsgHup' to its Step method and start a new election.
+    // 不用于节点间通信，仅用于发送给本节点让本节点进行选举
     MsgHup = 0;
     // 'MessageType_MsgBeat' is a local message that signals the leader to send a heartbeat
     // of the 'MessageType_MsgHeartbeat' type to its followers.
+    // 不用于节点间通信，仅用于leader节点在heartbeat定时器到期时向集群中其他节点发送心跳消息
     MsgBeat = 1;
     // 'MessageType_MsgPropose' is a local message that proposes to append data to the leader's log entries.
     MsgPropose = 2;
@@ -52,6 +54,7 @@ enum MessageType {
     // 'MessageType_MsgAppendResponse' is response to log replication request('MessageType_MsgAppend').
     MsgAppendResponse = 4;
     // 'MessageType_MsgRequestVote' requests votes for election.
+    // 节点投票给自己以进行新一轮的选举
     MsgRequestVote = 5;
     // 'MessageType_MsgRequestVoteResponse' contains responses from voting request.
     MsgRequestVoteResponse = 6;
@@ -81,11 +84,14 @@ message Message {
     bool reject = 10;
 }
 
-// HardState contains the state of a node need to be peristed, including the current term, commit index 
+// HardState contains the state of a node need to be persisted, including the current term, commit index
 // and the vote record
 message HardState {
+    // 当前任期
     uint64 term = 1;
+    // 当前任期中节点所投票的候选人ID
     uint64 vote = 2;
+    // 当前已提交的日志条目的最大索引
     uint64 commit = 3;
 }
 
