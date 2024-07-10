@@ -16,7 +16,8 @@ package raft
 
 import (
 	"errors"
-	"fmt"
+	"github.com/pingcap/log"
+	"go.uber.org/zap"
 
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
@@ -115,7 +116,6 @@ func (rn *RawNode) Campaign() error {
 // Propose proposes data be appended to the raft log.
 func (rn *RawNode) Propose(data []byte) error {
 	ent := pb.Entry{Data: data}
-	fmt.Println("project2btest ent", ent)
 	return rn.Raft.Step(pb.Message{
 		MsgType: pb.MessageType_MsgPropose,
 		From:    rn.Raft.id,
@@ -238,7 +238,7 @@ func (rn *RawNode) HasReady() bool {
 func (rn *RawNode) Advance(rd Ready) {
 	// Your Code Here (2A).
 	if len(rd.CommittedEntries) > 0 {
-		fmt.Println("RawNode Advance applied to", rd.CommittedEntries[len(rd.CommittedEntries)-1].Index)
+		log.Debug("RawNode Advance applied to", zap.Uint64("index", rd.CommittedEntries[len(rd.CommittedEntries)-1].Index))
 		rn.Raft.RaftLog.applied = rd.CommittedEntries[len(rd.CommittedEntries)-1].Index
 	}
 	if len(rd.Entries) > 0 {

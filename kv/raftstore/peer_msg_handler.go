@@ -63,22 +63,23 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		// Use Transport to send raft messages to other peers, it’s in the GlobalContext
 		d.Send(d.ctx.trans, ready.Messages)
 		// applying committed entries
-		// 即为
+		// apply the committed entries and update the applied index in one write batch
+		// 即为经过Raft节点Commit之后，需要apply的日志（里面存放着Request）
 		wb := &engine_util.WriteBatch{}
 		for _, entry := range ready.CommittedEntries {
 			// process entry
 			// applies the committed entry to the state machine
 			d.processCommittedEntry(entry, wb)
 		}
-		// applied update
+		// applied index update -> kv's applyState
 		if len(ready.CommittedEntries) > 0 {
-			fmt.Println("HandleRaftReady committed len:", len(ready.CommittedEntries))
+			log.Debug("HandleRaftReady committed len: %v", len(ready.CommittedEntries))
 			d.peerStorage.applyState.AppliedIndex = ready.CommittedEntries[len(ready.CommittedEntries)-1].Index
 			err = wb.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
 			if err != nil {
-				fmt.Println("HandleRaftReady's setMeta error", fmt.Errorf(err.Error()))
+				log.Error("HandleRaftReady's setMeta error", fmt.Errorf(err.Error()))
 			}
-			wb.MustWriteToDB(d.peerStorage.Engines.Kv)
+			wb.WriteToDB(d.peerStorage.Engines.Kv)
 		}
 		// advance rd
 		d.RaftGroup.Advance(ready)
@@ -92,90 +93,92 @@ func (d *peerMsgHandler) HandleRaftReady() {
 // 就是把entry中的操作拿给kvDB去实际执行（例如put、delete某个数据）
 func (d *peerMsgHandler) processCommittedEntry(entry eraftpb.Entry, wb *engine_util.WriteBatch) {
 	if entry.EntryType == eraftpb.EntryType_EntryNormal {
-		d.applyToDB(entry, wb)
-		wb.MustWriteToDB(d.peerStorage.Engines.Kv)
+		d.applyToDbAndRespond(entry, wb)
+		// wb.WriteToDB(d.peerStorage.Engines.Kv)
 	} else if entry.EntryType == eraftpb.EntryType_EntryConfChange {
 
 	}
 }
 
-func (d *peerMsgHandler) applyToDB(entry eraftpb.Entry, wb *engine_util.WriteBatch) {
+// applyToDB EntryNormal类型，执行entry解码出来的Requests中的4种操作，并响应Proposal
+func (d *peerMsgHandler) applyToDbAndRespond(entry eraftpb.Entry, wb *engine_util.WriteBatch) {
 	msg := &raft_cmdpb.RaftCmdRequest{}
 	err := msg.Unmarshal(entry.Data)
 	if err != nil {
-		fmt.Println("HandleRaftReady's unmarshal error", fmt.Errorf(err.Error()))
-		return
+		log.Error("HandleRaftReady's unmarshal error", fmt.Errorf(err.Error()))
 	}
 	cmdResponse := &raft_cmdpb.RaftCmdResponse{
 		Header:    &raft_cmdpb.RaftResponseHeader{},
 		Responses: []*raft_cmdpb.Response{},
 	}
-	for _, request := range msg.Requests {
-		// 把entry中的操作拿给kvDB去实际执行（例如put、delete某个数据）
-		switch request.CmdType {
-		case raft_cmdpb.CmdType_Put:
-			fmt.Println("applyToDB Put op", request.Put.GetCf(), string(request.Put.GetKey()), string(request.Put.GetValue()))
-			wb.SetCF(request.Put.GetCf(), request.Put.GetKey(), request.Put.GetValue())
-		case raft_cmdpb.CmdType_Delete:
-			fmt.Println("applyToDB Delete op", request.Delete.GetCf(), string(request.Delete.GetKey()))
-			wb.DeleteCF(request.Delete.GetCf(), request.Delete.GetKey())
-		}
-
-		log.Infof("applyToDB's proposals:%v", d.proposals)
-		var correspondingProposal *proposal
-		if d.checkError(entry) == false {
-			correspondingProposal = nil
-		} else {
-			correspondingProposal = d.proposals[0]
+	if len(msg.Requests) > 0 {
+		for _, request := range msg.Requests {
+			// 如果是Put或者Delete，把entry中的操作拿给kvDB去实际执行
 			switch request.CmdType {
-			case raft_cmdpb.CmdType_Invalid:
-				cmdResponse.Responses = append(cmdResponse.Responses, &raft_cmdpb.Response{
-					CmdType: raft_cmdpb.CmdType_Invalid,
-				})
-			case raft_cmdpb.CmdType_Get:
-				fmt.Println("applyToDB Get op", request.Get.GetCf(), string(request.Get.GetKey()))
-				val, err := engine_util.GetCF(d.peerStorage.Engines.Kv, request.Get.GetCf(), request.Get.GetKey())
-				if err != nil {
-					fmt.Println("HandleRaftReady's get error", fmt.Errorf(err.Error()))
-				}
-				log.Debugf("applyToDB Get %s %s %s", request.Get.GetCf(), request.Get.GetKey(), val)
-				cmdResponse.Responses = append(cmdResponse.Responses, &raft_cmdpb.Response{
-					CmdType: raft_cmdpb.CmdType_Get,
-					Get:     &raft_cmdpb.GetResponse{Value: val},
-				})
 			case raft_cmdpb.CmdType_Put:
-				cmdResponse.Responses = append(cmdResponse.Responses, &raft_cmdpb.Response{
-					CmdType: raft_cmdpb.CmdType_Put,
-					Put:     &raft_cmdpb.PutResponse{},
-				})
+				log.Debug("applyToDB Put op", request.Put.GetCf(), string(request.Put.GetKey()), string(request.Put.GetValue()))
+				wb.SetCF(request.Put.GetCf(), request.Put.GetKey(), request.Put.GetValue())
 			case raft_cmdpb.CmdType_Delete:
-				cmdResponse.Responses = append(cmdResponse.Responses, &raft_cmdpb.Response{
-					CmdType: raft_cmdpb.CmdType_Delete,
-					Delete:  &raft_cmdpb.DeleteResponse{},
-				})
-			case raft_cmdpb.CmdType_Snap: // scan ?
-				// in later exp (x)
-				// in current exp
-				// Scan -> Request -> CallCommandInStore -> here
-				// need resp, cb.Txn
-				fmt.Println("applyToDB Scan op", request.Snap)
-				cmdResponse.Responses = append(cmdResponse.Responses, &raft_cmdpb.Response{
-					CmdType: raft_cmdpb.CmdType_Snap,
-					Snap: &raft_cmdpb.SnapResponse{
-						Region: d.Region(),
-					},
-				})
-				if correspondingProposal != nil {
+				log.Debug("applyToDB Delete op", request.Delete.GetCf(), string(request.Delete.GetKey()))
+				wb.DeleteCF(request.Delete.GetCf(), request.Delete.GetKey())
+			}
+
+			log.Infof("applyToDB's proposals:%v", d.proposals)
+			var correspondingProposal *proposal
+			// len = 0, index not right, term not right
+			// 如果proposal检查无错误，那么选择这个proposal进行回应，否则忽略这个proposal
+			if d.checkError(entry) == false {
+				if len(d.proposals) > 0 {
+					d.proposals = d.proposals[1:]
+				}
+			} else {
+				correspondingProposal = d.proposals[0]
+				switch request.CmdType {
+				case raft_cmdpb.CmdType_Invalid:
+					cmdResponse.Responses = append(cmdResponse.Responses, &raft_cmdpb.Response{
+						CmdType: raft_cmdpb.CmdType_Invalid,
+					})
+				case raft_cmdpb.CmdType_Get:
+					// fmt.Println("applyToDB Get op", request.Get.GetCf(), string(request.Get.GetKey()))
+					// Get操作需要返回value
+					val, err := engine_util.GetCF(d.peerStorage.Engines.Kv, request.Get.GetCf(), request.Get.GetKey())
+					if err != nil {
+						fmt.Println("HandleRaftReady's get error", fmt.Errorf(err.Error()))
+					}
+					log.Debugf("applyToDB Get %s %s %s", request.Get.GetCf(), request.Get.GetKey(), val)
+					cmdResponse.Responses = append(cmdResponse.Responses, &raft_cmdpb.Response{
+						CmdType: raft_cmdpb.CmdType_Get,
+						Get:     &raft_cmdpb.GetResponse{Value: val},
+					})
+				case raft_cmdpb.CmdType_Put:
+					cmdResponse.Responses = append(cmdResponse.Responses, &raft_cmdpb.Response{
+						CmdType: raft_cmdpb.CmdType_Put,
+						Put:     &raft_cmdpb.PutResponse{},
+					})
+				case raft_cmdpb.CmdType_Delete:
+					cmdResponse.Responses = append(cmdResponse.Responses, &raft_cmdpb.Response{
+						CmdType: raft_cmdpb.CmdType_Delete,
+						Delete:  &raft_cmdpb.DeleteResponse{},
+					})
+				case raft_cmdpb.CmdType_Snap: // scan ?
+					// in current exp
+					// Scan -> Request -> CallCommandInStore -> here
+					// need resp, cb.Txn
+					log.Debug("applyToDB Scan op", request.Snap)
+					cmdResponse.Responses = append(cmdResponse.Responses, &raft_cmdpb.Response{
+						CmdType: raft_cmdpb.CmdType_Snap,
+						Snap: &raft_cmdpb.SnapResponse{
+							Region: d.Region(),
+						},
+					})
+					// Scan操作需要返回一个Txn
 					correspondingProposal.cb.Txn = d.peerStorage.Engines.Kv.NewTransaction(false)
 				}
+				correspondingProposal.cb.Done(cmdResponse)
+				// 推进proposal进程
+				d.proposals = d.proposals[1:]
 			}
 		}
-		if correspondingProposal != nil {
-			// no error, put response
-			correspondingProposal.cb.Done(cmdResponse)
-			d.proposals = d.proposals[1:]
-		}
-		// 应用之后不做响应
 	}
 }
 
@@ -184,14 +187,14 @@ func (d *peerMsgHandler) checkError(entry eraftpb.Entry) bool {
 		correspondingProposal := d.proposals[0]
 		if correspondingProposal.index == entry.Index {
 			if correspondingProposal.term != entry.Term { // 可能是由于领导者更改，某些日志未提交并被新领导者的日志覆盖
-				fmt.Println("callBackProposals Term unequal")
+				log.Error("callBackProposals Term unequal")
 				NotifyStaleReq(entry.Term, correspondingProposal.cb)
-				d.proposals = d.proposals[1:]
 				return false
+			} else {
+				return true
 			}
-		} else {
-			return true
 		}
+		return false
 	}
 	return false
 }

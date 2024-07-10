@@ -18,6 +18,8 @@ import (
 	"errors"
 	"fmt"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+	"github.com/pingcap/log"
+	"go.uber.org/zap"
 	"math/rand"
 )
 
@@ -582,7 +584,7 @@ func (r *Raft) HandlePropose(m pb.Message) {
 	}
 	// 注意，propose的信息只有data信息，其他信息需要自己补充
 	for _, entry := range entries {
-		fmt.Printf("propose append entry Data:%v\n", entry.Data)
+		log.Debug("propose append entry Data:%v\n", zap.String("data", string(entry.Data)))
 		// r.RaftLog.entries = append(r.RaftLog.entries, *entry)
 		appEntry := pb.Entry{
 			EntryType: pb.EntryType_EntryNormal,

@@ -326,7 +326,7 @@ func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.Write
 	commitLastIndex := entries[len(entries)-1].Index
 	stabledLastIndex, err := ps.LastIndex()
 	if err != nil {
-		fmt.Println("PeerStorage Append error")
+		log.Debug("PeerStorage Append error")
 		return err
 	}
 	if commitLastIndex < stabledLastIndex {
