@@ -582,7 +582,7 @@ func (r *Raft) HandlePropose(m pb.Message) {
 	}
 	// 注意，propose的信息只有data信息，其他信息需要自己补充
 	for _, entry := range entries {
-		// fmt.Printf("propose append entry Term:%v Data:%v\n", entry.Term, entry.Data)
+		fmt.Printf("propose append entry Data:%v\n", entry.Data)
 		// r.RaftLog.entries = append(r.RaftLog.entries, *entry)
 		appEntry := pb.Entry{
 			EntryType: pb.EntryType_EntryNormal,

@@ -2,6 +2,9 @@ package raftstore
 
 import (
 	"fmt"
+	"github.com/pingcap-incubator/tinykv/kv/raftstore/meta"
+	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
+	"github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 	"time"
 
 	"github.com/Connor1996/badger/y"
@@ -38,14 +41,159 @@ func newPeerMsgHandler(peer *peer, ctx *GlobalContext) *peerMsgHandler {
 	}
 }
 
+// HandleRaftReady After the message is processed, the Raft node should have some state updates.
 // HandleRaftReady should get the ready from Raft module and do corresponding actions like persisting log entries,
 // applying committed entries and sending raft messages to other peers through the network
+// CommittedEntries是client propose的entry经过commit操作后需要apply的
 func (d *peerMsgHandler) HandleRaftReady() {
 	if d.stopped {
 		return
 	}
 	// Your Code Here (2B).
+	// get the ready from Raft module
+	if d.RaftGroup.HasReady() {
+		ready := d.RaftGroup.Ready()
+		// use the provided method SaveReadyState() to persist the Raft related states
+		_, err := d.peerStorage.SaveReadyState(&ready)
+		if err != nil {
+			fmt.Println("HandleRaftReady's error", fmt.Errorf(err.Error()))
+			return
+		}
+		// sending raft messages to other peers through the network
+		// Use Transport to send raft messages to other peers, it’s in the GlobalContext
+		d.Send(d.ctx.trans, ready.Messages)
+		// applying committed entries
+		// 即为
+		wb := &engine_util.WriteBatch{}
+		for _, entry := range ready.CommittedEntries {
+			// process entry
+			// applies the committed entry to the state machine
+			d.processCommittedEntry(entry, wb)
+		}
+		// applied update
+		if len(ready.CommittedEntries) > 0 {
+			fmt.Println("HandleRaftReady committed len:", len(ready.CommittedEntries))
+			d.peerStorage.applyState.AppliedIndex = ready.CommittedEntries[len(ready.CommittedEntries)-1].Index
+			err = wb.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
+			if err != nil {
+				fmt.Println("HandleRaftReady's setMeta error", fmt.Errorf(err.Error()))
+			}
+			wb.MustWriteToDB(d.peerStorage.Engines.Kv)
+		}
+		// advance rd
+		d.RaftGroup.Advance(ready)
+	}
+}
 
+// processCommittedEntry applies the committed entry to the state machine(kv db)
+// CommittedEntries是client propose的entry经过commit操作后需要apply的
+// 每执行完一次 apply，都需要对 proposals 中的相应Index的proposal进行 callback 回应（调用 cb.Done()），
+// 表示这条命令已经完成了（如果是Get命令还会返回取到的value），然后从中删除这个proposal
+// 就是把entry中的操作拿给kvDB去实际执行（例如put、delete某个数据）
+func (d *peerMsgHandler) processCommittedEntry(entry eraftpb.Entry, wb *engine_util.WriteBatch) {
+	if entry.EntryType == eraftpb.EntryType_EntryNormal {
+		d.applyToDB(entry, wb)
+		wb.MustWriteToDB(d.peerStorage.Engines.Kv)
+	} else if entry.EntryType == eraftpb.EntryType_EntryConfChange {
+
+	}
+}
+
+func (d *peerMsgHandler) applyToDB(entry eraftpb.Entry, wb *engine_util.WriteBatch) {
+	msg := &raft_cmdpb.RaftCmdRequest{}
+	err := msg.Unmarshal(entry.Data)
+	if err != nil {
+		fmt.Println("HandleRaftReady's unmarshal error", fmt.Errorf(err.Error()))
+		return
+	}
+	cmdResponse := &raft_cmdpb.RaftCmdResponse{
+		Header:    &raft_cmdpb.RaftResponseHeader{},
+		Responses: []*raft_cmdpb.Response{},
+	}
+	for _, request := range msg.Requests {
+		// 把entry中的操作拿给kvDB去实际执行（例如put、delete某个数据）
+		switch request.CmdType {
+		case raft_cmdpb.CmdType_Put:
+			fmt.Println("applyToDB Put op", request.Put.GetCf(), string(request.Put.GetKey()), string(request.Put.GetValue()))
+			wb.SetCF(request.Put.GetCf(), request.Put.GetKey(), request.Put.GetValue())
+		case raft_cmdpb.CmdType_Delete:
+			fmt.Println("applyToDB Delete op", request.Delete.GetCf(), string(request.Delete.GetKey()))
+			wb.DeleteCF(request.Delete.GetCf(), request.Delete.GetKey())
+		}
+
+		log.Infof("applyToDB's proposals:%v", d.proposals)
+		var correspondingProposal *proposal
+		if d.checkError(entry) == false {
+			correspondingProposal = nil
+		} else {
+			correspondingProposal = d.proposals[0]
+			switch request.CmdType {
+			case raft_cmdpb.CmdType_Invalid:
+				cmdResponse.Responses = append(cmdResponse.Responses, &raft_cmdpb.Response{
+					CmdType: raft_cmdpb.CmdType_Invalid,
+				})
+			case raft_cmdpb.CmdType_Get:
+				fmt.Println("applyToDB Get op", request.Get.GetCf(), string(request.Get.GetKey()))
+				val, err := engine_util.GetCF(d.peerStorage.Engines.Kv, request.Get.GetCf(), request.Get.GetKey())
+				if err != nil {
+					fmt.Println("HandleRaftReady's get error", fmt.Errorf(err.Error()))
+				}
+				log.Debugf("applyToDB Get %s %s %s", request.Get.GetCf(), request.Get.GetKey(), val)
+				cmdResponse.Responses = append(cmdResponse.Responses, &raft_cmdpb.Response{
+					CmdType: raft_cmdpb.CmdType_Get,
+					Get:     &raft_cmdpb.GetResponse{Value: val},
+				})
+			case raft_cmdpb.CmdType_Put:
+				cmdResponse.Responses = append(cmdResponse.Responses, &raft_cmdpb.Response{
+					CmdType: raft_cmdpb.CmdType_Put,
+					Put:     &raft_cmdpb.PutResponse{},
+				})
+			case raft_cmdpb.CmdType_Delete:
+				cmdResponse.Responses = append(cmdResponse.Responses, &raft_cmdpb.Response{
+					CmdType: raft_cmdpb.CmdType_Delete,
+					Delete:  &raft_cmdpb.DeleteResponse{},
+				})
+			case raft_cmdpb.CmdType_Snap: // scan ?
+				// in later exp (x)
+				// in current exp
+				// Scan -> Request -> CallCommandInStore -> here
+				// need resp, cb.Txn
+				fmt.Println("applyToDB Scan op", request.Snap)
+				cmdResponse.Responses = append(cmdResponse.Responses, &raft_cmdpb.Response{
+					CmdType: raft_cmdpb.CmdType_Snap,
+					Snap: &raft_cmdpb.SnapResponse{
+						Region: d.Region(),
+					},
+				})
+				if correspondingProposal != nil {
+					correspondingProposal.cb.Txn = d.peerStorage.Engines.Kv.NewTransaction(false)
+				}
+			}
+		}
+		if correspondingProposal != nil {
+			// no error, put response
+			correspondingProposal.cb.Done(cmdResponse)
+			d.proposals = d.proposals[1:]
+		}
+		// 应用之后不做响应
+	}
+}
+
+func (d *peerMsgHandler) checkError(entry eraftpb.Entry) bool {
+	if len(d.proposals) > 0 {
+		correspondingProposal := d.proposals[0]
+		if correspondingProposal.index == entry.Index {
+			if correspondingProposal.term != entry.Term { // 可能是由于领导者更改，某些日志未提交并被新领导者的日志覆盖
+				fmt.Println("callBackProposals Term unequal")
+				NotifyStaleReq(entry.Term, correspondingProposal.cb)
+				d.proposals = d.proposals[1:]
+				return false
+			}
+		} else {
+			return true
+		}
+	}
+	return false
 }
 
 // HandleMsg processes all the messages received from raftCh
@@ -75,6 +223,7 @@ func (d *peerMsgHandler) HandleMsg(msg message.Msg) {
 	}
 }
 
+// preProposeRaftCommand do some checks about req, make sure the msg is valid
 func (d *peerMsgHandler) preProposeRaftCommand(req *raft_cmdpb.RaftCmdRequest) error {
 	// Check store_id, make sure that the msg is dispatched to the right place.
 	if err := util.CheckStoreID(req, d.storeID()); err != nil {
@@ -111,6 +260,16 @@ func (d *peerMsgHandler) preProposeRaftCommand(req *raft_cmdpb.RaftCmdRequest) e
 	return err
 }
 
+// proposeRaftCommand
+// 将上层命令打包成日志发送给raft
+// proposals 是 封装的回调结构体，是一个切片。当上层想要让 peer 执行一些命令时，会发送一个 RaftCmdRequest 给该 peer，而这个 RaftCmdRequest 里有很多个 Request，
+// 需要底层执行的命令就在这些 Request 中。这些 Request 会被封装成一个 entry 交给 peer 去在集群中同步。当 entry 被 apply 时，对应的命令就会被执行。
+// callback 里面包含了response，txn与Done
+// 上层怎么知道底层的这些命令真的被执行并且得到命令的执行结果呢？这就是 callback 的作用。
+// 每当 peer 接收到 RaftCmdRequest 时，就会给里面的每一个 Request 一个 callback，然后封装成 proposal，其中 term 就为该 Request 对应 entry 生成时的 term 以及 index。
+// 当 rawNode 返回一个 Ready 回去时，说明上述那些 entries 已经完成了同步，因此上层就可以通过 HandleRaftReady 对这些 entries 进行 apply（即执行底层读写命令）。
+// 每执行完一次 apply，都需要对 proposals 中的相应 Index 的 proposal 进行 callback 回应（调用 cb.Done()）
+// 表示这条命令已经完成了（如果是 Get 命令还会返回取到的 value），然后从中删除这个 proposal。
 func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
 	err := d.preProposeRaftCommand(msg)
 	if err != nil {
@@ -118,7 +277,40 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		return
 	}
 	// Your Code Here (2B).
+	// d.proposals Record the callback of the proposals
+	// We can't enclose normal requests and administrator request at same time.
+	if len(msg.Requests) > 0 { // normal requests (例如对键值存储的读写操作)
+		prop := &proposal{
+			index: d.nextProposalIndex(),
+			term:  d.Term(),
+			cb:    cb,
+		}
+		data, err := msg.Marshal()
+		if err != nil {
+			log.Errorf("proposeRaftCommand err: " + err.Error())
+			cb.Done(ErrResp(err))
+			return
+		}
+		// fmt.Println("proposeRaftCommand msg data ", data)
+		err = d.RaftGroup.Propose(data)
+		if err != nil {
+			log.Errorf("proposeRaftCommand err: " + err.Error())
+			cb.Done(ErrResp(err))
+		}
+		d.proposals = append(d.proposals, prop)
+	} else { // administrator request (如配置更改、成员管理等)
+	}
+}
 
+func (d *peerMsgHandler) processRaftCommandMsgRequest(req *raft_cmdpb.Request, cb *message.Callback) {
+	// 每当 peer 接收到 RaftCmdRequest 时，就会给里面的每一个 Request 一个 callback，然后封装成 proposal，
+	// 其中 term 就为该 Request 对应 entry 生成时的 term 以及 index。
+	prop := &proposal{
+		index: d.RaftGroup.Raft.RaftLog.LastIndex(),
+		term:  d.RaftGroup.Raft.Term,
+		cb:    nil,
+	}
+	d.proposals = append(d.proposals, prop)
 }
 
 func (d *peerMsgHandler) onTick() {
@@ -166,6 +358,7 @@ func (d *peerMsgHandler) ScheduleCompactLog(truncatedIndex uint64) {
 	d.ctx.raftLogGCTaskSender <- raftLogGCTask
 }
 
+// onRaftMsg process the RaftMsg and Step it
 func (d *peerMsgHandler) onRaftMsg(msg *rspb.RaftMessage) error {
 	log.Debugf("%s handle raft message %s from %d to %d",
 		d.Tag, msg.GetMessage().GetMsgType(), msg.GetFromPeer().GetId(), msg.GetToPeer().GetId())

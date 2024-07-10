@@ -16,6 +16,7 @@ package raft
 
 import (
 	"errors"
+	"fmt"
 
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
@@ -60,7 +61,7 @@ type Ready struct {
 	// CommittedEntries specifies entries to be committed to a
 	// store/state-machine. These have previously been committed to stable
 	// store.
-	// 已提交的日志条目，等待应用到状态机 applied -> committed
+	// 已提交的日志条目，等待应用到状态机 committed -> applied
 	CommittedEntries []pb.Entry
 
 	// Messages specifies outbound messages to be sent AFTER Entries are
@@ -114,6 +115,7 @@ func (rn *RawNode) Campaign() error {
 // Propose proposes data be appended to the raft log.
 func (rn *RawNode) Propose(data []byte) error {
 	ent := pb.Entry{Data: data}
+	fmt.Println("project2btest ent", ent)
 	return rn.Raft.Step(pb.Message{
 		MsgType: pb.MessageType_MsgPropose,
 		From:    rn.Raft.id,
@@ -185,8 +187,6 @@ func (rn *RawNode) Ready() Ready {
 			Vote:   rn.Raft.Vote,
 		}
 		rn.prevHardState = sendHardState
-	} else {
-		sendHardState = pb.HardState{}
 	}
 
 	var sendMsgs []pb.Message
@@ -210,6 +210,14 @@ func (rn *RawNode) Ready() Ready {
 // HasReady called when RawNode user need to check if any Ready pending.
 func (rn *RawNode) HasReady() bool {
 	// Your Code Here (2A).
+	currentHardState := pb.HardState{
+		Term:   rn.Raft.Term,
+		Vote:   rn.Raft.Vote,
+		Commit: rn.Raft.RaftLog.committed,
+	}
+	if IsEmptyHardState(currentHardState) == true {
+		return false
+	}
 	// SoftState与HardState是否发生改变
 	if rn.prevSoftState.Lead != rn.Raft.Lead || rn.prevSoftState.RaftState != rn.Raft.State {
 		return true
@@ -230,10 +238,14 @@ func (rn *RawNode) HasReady() bool {
 func (rn *RawNode) Advance(rd Ready) {
 	// Your Code Here (2A).
 	if len(rd.CommittedEntries) > 0 {
+		fmt.Println("RawNode Advance applied to", rd.CommittedEntries[len(rd.CommittedEntries)-1].Index)
 		rn.Raft.RaftLog.applied = rd.CommittedEntries[len(rd.CommittedEntries)-1].Index
 	}
 	if len(rd.Entries) > 0 {
 		rn.Raft.RaftLog.stabled = rd.Entries[len(rd.Entries)-1].Index
+	}
+	if IsEmptyHardState(rd.HardState) == false {
+		rn.prevHardState = rd.HardState
 	}
 }
 
