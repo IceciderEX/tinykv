@@ -31,7 +31,9 @@ message SnapshotMetadata {
     uint64 term = 3;
 }
 
+// 当领导者需要向追随者发送 Snapshot 消息时，它可以调用 Storage.Snapshot() 以获取 eraftpb.Snapshot
 message Snapshot {
+    // some metadata is used by the upper application which you can ignore for now(2C)
     bytes data = 1;
     SnapshotMetadata metadata = 2;
 }

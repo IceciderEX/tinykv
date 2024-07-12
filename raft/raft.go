@@ -332,19 +332,6 @@ func (r *Raft) sendRequestVoteResponse(candidateId uint64, reject bool) {
 	r.msgs = append(r.msgs, msg)
 }
 
-// handleSnapShot follower
-func (r *Raft) handleSnapShot(message pb.Message) {
-	if r.Term > message.Term {
-
-	}
-
-	snapShot := message.Snapshot
-	offset := snapShot.Metadata.Index
-	if offset == 0 { //
-		r.RaftLog.storage.Snapshot()
-	}
-}
-
 // handleHeartbeat follower handle Heartbeat RPC request
 // 根据 Commit 推进自己的 committed
 func (r *Raft) handleHeartbeat(m pb.Message) {
@@ -517,6 +504,7 @@ func (r *Raft) stepForFollower(m pb.Message) {
 		r.handleRequestVote(m)
 	// case pb.MessageType_MsgRequestVoteResponse:
 	case pb.MessageType_MsgSnapshot:
+		r.handleSnapshot(m)
 	case pb.MessageType_MsgHeartbeat:
 		r.handleHeartbeat(m)
 	//case pb.MessageType_MsgHeartbeatResponse:
@@ -544,6 +532,7 @@ func (r *Raft) stepForCandidate(m pb.Message) {
 	case pb.MessageType_MsgRequestVoteResponse:
 		r.handleRequestVoteResponse(m)
 	case pb.MessageType_MsgSnapshot:
+		r.handleSnapshot(m)
 	case pb.MessageType_MsgHeartbeat:
 		r.handleHeartbeat(m)
 	// case pb.MessageType_MsgHeartbeatResponse:
@@ -568,6 +557,7 @@ func (r *Raft) stepForLeader(m pb.Message) {
 		r.handleRequestVote(m)
 	// case pb.MessageType_MsgRequestVoteResponse:
 	case pb.MessageType_MsgSnapshot:
+		r.handleSnapshot(m)
 	// case pb.MessageType_MsgHeartbeat:
 	case pb.MessageType_MsgHeartbeatResponse:
 		r.handleHeartbeatResponse(m)
@@ -623,8 +613,15 @@ func (r *Raft) sendAppend(to uint64) bool {
 	// Your Code Here (2A).
 	prevLogIndex := r.Prs[to].Next - 1 // follower紧邻新日志条目之前的那个日志条目的索引
 	prevLogTerm, err := r.RaftLog.Term(prevLogIndex)
+	if r.RaftLog.LastIndex() < prevLogIndex {
+		return false
+	}
 	if err != nil {
-		fmt.Println("sendAppend term err:", err)
+		log.Debug("sendAppend term err:", zap.String("err", err.Error()))
+		// snapshot send scenario
+		if errors.Is(err, ErrCompacted) {
+			r.sendSnapshot(to)
+		}
 		return false
 	}
 
@@ -794,9 +791,12 @@ func (r *Raft) handleHeartbeatResponse(m pb.Message) {
 	// discover server with higher term
 	if m.Term > r.Term {
 		r.becomeFollower(m.Term, None)
+		return
 	}
 	// follower 日志是可能落后的, 触发 append 流程
-	if r.Prs[m.From].Match < r.RaftLog.LastIndex() {
+	lastIndex := r.RaftLog.LastIndex()
+	lastTerm, _ := r.RaftLog.Term(lastIndex)
+	if lastTerm > m.LogTerm || (lastTerm == m.LogTerm && lastIndex > m.Index) {
 		r.sendAppend(m.From)
 	}
 }
@@ -846,24 +846,86 @@ func (r *Raft) handleTimeout(m pb.Message) {
 	r.heartbeatElapsed = 0
 }
 
-// sendSnapShot leader发送快照消息
-func (r *Raft) sendSnapShot(to uint64) {
-	snapShot, err := r.RaftLog.storage.Snapshot()
+// sendSnapshot send Snapshot RPC request
+// Raft module maybe needs to send a snapshot. PeerStorage implements Storage.Snapshot()
+// At the next time Raft calling Snapshot, it checks whether the snapshot generating is finished.
+// If yes, Raft should send the snapshot message to other peers
+// the snapshot message will be handled by onRaftMsg after the snapshot is received
+func (r *Raft) sendSnapshot(to uint64) {
+	// Raft 也包含一些少量的元数据到快照中：
+	// 最后被包含索引指的是被快照取代的最后的条目在日志中的索引值（状态机最后应用的日志），最后被包含的任期指的是该条目的任期号
+	snapshot, err := r.RaftLog.storage.Snapshot()
 	if err != nil {
-		fmt.Println(fmt.Errorf(err.Error()))
+		// ErrSnapshotTemporarilyUnavailable
+		log.Debug("sendSnapshot ErrSnapshotTemporarilyUnavailable")
+		return
+	} else {
+		// send the snapshot message to other peers
+		msg := pb.Message{
+			MsgType:  pb.MessageType_MsgSnapshot,
+			From:     r.id,
+			To:       to,
+			Snapshot: &snapshot,
+			Term:     r.Term,
+		}
+		r.msgs = append(r.msgs, msg)
+		// update the next index
+		r.Prs[to].Next = snapshot.Metadata.Index + 1
 	}
-	msg := pb.Message{
-		MsgType:  pb.MessageType_MsgSnapshot,
-		From:     r.id,
-		To:       to,
-		Snapshot: &snapShot,
-	}
-	r.msgs = append(r.msgs, msg)
 }
 
 // handleSnapshot handle Snapshot RPC request
+// 从消息 eraftpb.SnapshotMetadata 中恢复 raft 内部状态，如Term、提交索引和成员信息等
 func (r *Raft) handleSnapshot(m pb.Message) {
 	// Your Code Here (2C).
+	snapshot := m.Snapshot
+	if m.Term < r.Term {
+		r.sendSnapResponse(m.From, true, 0)
+		return
+	}
+	r.becomeFollower(m.Term, m.From)
+	// 如果 snapshot 的 Index 小于或等于当前已经提交的日志的 Index，说明这个 snapshot 已经过时
+	if snapshot.Metadata.Index <= r.RaftLog.committed {
+		// 通知leader更新自己的next
+		r.sendSnapResponse(m.From, false, r.RaftLog.committed)
+		return
+	}
+
+	// 通常快照会包含没有在接收者日志中存在的信息。在这种情况下，跟随者丢弃其整个日志；它全部被快照取代，并且可能包含与快照冲突的未提交条目。
+	// 如果接收到的快照是自己日志的前面部分（由于网络重传或者错误），那么被快照包含的条目将会被全部删除，但是快照后面的条目仍然有效，必须保留
+
+	// 根据其中的 Metadata 来更新自己的 committed、applied、stabled 等等。
+	// 丢弃整个日志
+	r.RaftLog.entries = make([]pb.Entry, 0)
+	r.RaftLog.committed = snapshot.Metadata.Index
+	r.RaftLog.applied = snapshot.Metadata.Index
+	r.RaftLog.stabled = snapshot.Metadata.Index
+	r.RaftLog.entryFirstIdx = snapshot.Metadata.Index + 1
+	r.RaftLog.LastIndex()
+
+	r.RaftLog.pendingSnapshot = snapshot
+	// ConfState contains the current membership information of the raft group
+	// 根据其中的 ConfState 更新自己的 Prs 信息
+	r.Prs = make(map[uint64]*Progress)
+	for _, id := range snapshot.Metadata.ConfState.Nodes {
+		r.Prs[id] = &Progress{
+			Match: None,
+			Next:  snapshot.Metadata.Index + 1,
+		}
+	}
+	r.sendSnapResponse(m.From, false, snapshot.Metadata.Index)
+}
+
+func (r *Raft) sendSnapResponse(to uint64, reject bool, index uint64) {
+	msg := pb.Message{
+		MsgType: pb.MessageType_MsgAppendResponse,
+		To:      to,
+		From:    r.id,
+		Term:    r.Term,
+		Reject:  reject,
+		Index:   index,
+	}
+	r.msgs = append(r.msgs, msg)
 }
 
 // addNode add a new node to raft group

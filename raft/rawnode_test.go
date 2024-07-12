@@ -16,6 +16,7 @@ package raft
 
 import (
 	"bytes"
+	"fmt"
 	"reflect"
 	"testing"
 
@@ -246,6 +247,8 @@ func TestRawNodeRestartFromSnapshot2C(t *testing.T) {
 	} else {
 		rawNode.Advance(rd)
 	}
+	// applied = 3,
+	fmt.Println("TestRawNodeRestartFromSnapshot2C")
 	if rawNode.HasReady() {
 		t.Errorf("unexpected Ready: %+v", rawNode.HasReady())
 	}

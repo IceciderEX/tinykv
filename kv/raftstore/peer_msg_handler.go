@@ -59,6 +59,12 @@ func (d *peerMsgHandler) HandleRaftReady() {
 			fmt.Println("HandleRaftReady's error", fmt.Errorf(err.Error()))
 			return
 		}
+		// When you are sure to apply the snapshot, you can update the peer storage’s memory state
+		// like RaftLocalState, RaftApplyState, and RegionLocalState
+		// also don’t forget to persist these states to kvdb and raftdb and remove stale state from kvdb and raftdb
+		// Besides, you also need to update PeerStorage.snapState to snap.SnapState_Applying
+		// and send runner.RegionTaskApply task to region worker through PeerStorage.regionSched and wait until region worker finishes
+
 		// sending raft messages to other peers through the network
 		// Use Transport to send raft messages to other peers, it’s in the GlobalContext
 		d.Send(d.ctx.trans, ready.Messages)
@@ -79,7 +85,7 @@ func (d *peerMsgHandler) HandleRaftReady() {
 			if err != nil {
 				log.Error("HandleRaftReady's setMeta error", fmt.Errorf(err.Error()))
 			}
-			wb.WriteToDB(d.peerStorage.Engines.Kv)
+			wb.MustWriteToDB(d.peerStorage.Engines.Kv)
 		}
 		// advance rd
 		d.RaftGroup.Advance(ready)
@@ -111,6 +117,7 @@ func (d *peerMsgHandler) applyToDbAndRespond(entry eraftpb.Entry, wb *engine_uti
 		Header:    &raft_cmdpb.RaftResponseHeader{},
 		Responses: []*raft_cmdpb.Response{},
 	}
+	// normal requests(4 basic Op)
 	if len(msg.Requests) > 0 {
 		for _, request := range msg.Requests {
 			// 如果是Put或者Delete，把entry中的操作拿给kvDB去实际执行
@@ -123,7 +130,7 @@ func (d *peerMsgHandler) applyToDbAndRespond(entry eraftpb.Entry, wb *engine_uti
 				wb.DeleteCF(request.Delete.GetCf(), request.Delete.GetKey())
 			}
 
-			log.Infof("applyToDB's proposals:%v", d.proposals)
+			// log.Infof("applyToDB's proposals:%v", d.proposals)
 			var correspondingProposal *proposal
 			// len = 0, index not right, term not right
 			// 如果proposal检查无错误，那么选择这个proposal进行回应，否则忽略这个proposal
@@ -178,6 +185,24 @@ func (d *peerMsgHandler) applyToDbAndRespond(entry eraftpb.Entry, wb *engine_uti
 				// 推进proposal进程
 				d.proposals = d.proposals[1:]
 			}
+		}
+	} else if msg.AdminRequest != nil {
+		// admin command (snapshot...): CompactLogRequest
+		switch msg.AdminRequest.CmdType {
+		case raft_cmdpb.AdminCmdType_CompactLog:
+			// CompactLogRequest modifies metadata, namely updates the RaftTruncatedState which is in the RaftApplyState.
+			// After that, you should schedule a task to raftlog-gc worker by ScheduleCompactLog.
+			// Raftlog-gc worker will do the actual log deletion work asynchronously
+			// compactLog
+			compactLog := msg.AdminRequest.CompactLog
+			if compactLog.CompactIndex > d.peerStorage.applyState.TruncatedState.Index {
+				// TruncatedState: Record the index and term of the last raft log that have been truncated. (Used in 2C)
+				d.peerStorage.applyState.TruncatedState.Index = compactLog.CompactIndex
+				d.peerStorage.applyState.TruncatedState.Term = compactLog.CompactTerm
+				// raftWb.DeleteMeta(key) some sort of things
+				d.ScheduleCompactLog(compactLog.CompactIndex)
+			}
+		default:
 		}
 	}
 }
@@ -301,7 +326,22 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 			cb.Done(ErrResp(err))
 		}
 		d.proposals = append(d.proposals, prop)
-	} else { // administrator request (如配置更改、成员管理等)
+	} else if msg.AdminRequest != nil { // administrator request (如配置更改、成员管理等)
+		// snapshot
+		// request has: regionID, d.Meta, compactIdx, term
+		// 将 CompactLogRequest 请求 propose 到 Raft 中，等待 Raft Group 确认
+		switch msg.AdminRequest.CmdType {
+		case raft_cmdpb.AdminCmdType_CompactLog:
+			data, err := msg.Marshal()
+			if err != nil {
+				log.Errorf("proposeRaftCommand err: " + err.Error())
+			}
+			err = d.RaftGroup.Propose(data)
+			if err != nil {
+				log.Errorf("proposeRaftCommand err: " + err.Error())
+			}
+		default:
+		}
 	}
 }
 
@@ -351,6 +391,7 @@ func (d *peerMsgHandler) onRaftBaseTick() {
 }
 
 func (d *peerMsgHandler) ScheduleCompactLog(truncatedIndex uint64) {
+	// [LastCompactedIdx, truncatedIndex]
 	raftLogGCTask := &runner.RaftLogGCTask{
 		RaftEngine: d.ctx.engine.Raft,
 		RegionID:   d.regionId,
@@ -613,6 +654,7 @@ func (d *peerMsgHandler) onRaftGCLogTick() {
 	appliedIdx := d.peerStorage.AppliedIndex()
 	firstIdx, _ := d.peerStorage.FirstIndex()
 	var compactIdx uint64
+	// appliedIdx-firstIdx>= d.ctx.cfg.RaftLogGcCountLimit就需要生成一个新的快照
 	if appliedIdx > firstIdx && appliedIdx-firstIdx >= d.ctx.cfg.RaftLogGcCountLimit {
 		compactIdx = appliedIdx
 	} else {

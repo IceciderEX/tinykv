@@ -17,6 +17,8 @@ package raft
 import (
 	"fmt"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+	"github.com/pingcap/log"
+	"go.uber.org/zap"
 )
 
 // RaftLog manage the log entries, its struct look like:
@@ -100,7 +102,19 @@ func newLog(storage Storage) *RaftLog {
 // grow unlimitedly in memory
 func (l *RaftLog) maybeCompact() {
 	// Your Code Here (2C).
-	// todo snapshot 当 Snapshot 被应用后，需要清除 entries 中已经被 compact 的数据
+	// todo further implement
+	if len(l.entries) == 0 {
+		return
+	}
+	compactIndex, err := l.storage.FirstIndex()
+	if err != nil {
+		panic("maybeCompact err: " + err.Error())
+	}
+	if compactIndex > l.entryFirstIdx {
+		l.entries = l.entries[compactIndex-l.entryFirstIdx:]
+		// l.pendingSnapshot = nil
+		l.entryFirstIdx = compactIndex + 1
+	}
 }
 
 // allEntries return all the entries not compacted.
@@ -118,6 +132,8 @@ func (l *RaftLog) allEntries() []pb.Entry {
 
 // getPartEntries returns the go index if entries
 func (r *RaftLog) getPartEntries(begin, end uint64) []pb.Entry {
+	// log.Debug("getPartEntries", zap.Uint64("begin", begin), zap.Uint64("end", end))
+	// fmt.Println("getPartEntries", begin, " ", end, " ", r.entryFirstIdx)
 	return r.entries[begin-r.entryFirstIdx : end-r.entryFirstIdx]
 }
 
@@ -166,9 +182,13 @@ func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 func (l *RaftLog) LastIndex() uint64 {
 	// Your Code Here (2A).
 	if len(l.entries) == 0 {
+		// snapshot handle
+		if IsEmptySnap(l.pendingSnapshot) == false {
+			return l.pendingSnapshot.Metadata.Index
+		}
 		// entries为空，需要取值为storage的firstIndex-1
 		lastIdx, err := l.storage.FirstIndex()
-		// fmt.Printf("storage last:%v\n", lastIdx)
+		log.Debug("storage last:%v\n", zap.Uint64("last", lastIdx))
 		if err != nil {
 			fmt.Println(fmt.Errorf(err.Error()))
 			return 0
@@ -187,7 +207,8 @@ func (l *RaftLog) Term(i uint64) (uint64, error) {
 	// 检查索引是否在内存中的日志条目范围内。如果是，则计算内存中的索引并返回对应的条目的任期。
 	if i >= l.entryFirstIdx {
 		if i > l.LastIndex() {
-			return 0, fmt.Errorf("RaftLog Term index out of range")
+			// return 0, fmt.Errorf("RaftLog Term index out of range")
+			return 0, ErrUnavailable
 		}
 		entryIndex := i - l.entryFirstIdx
 		return l.entries[entryIndex].Term, nil
@@ -195,6 +216,14 @@ func (l *RaftLog) Term(i uint64) (uint64, error) {
 	// 否则从storage得到
 	term, err := l.storage.Term(i)
 	if err != nil {
+		// add snapshot handle
+		if IsEmptySnap(l.pendingSnapshot) == false {
+			if i == l.pendingSnapshot.Metadata.Index {
+				return l.pendingSnapshot.Metadata.Term, nil
+			} else {
+				return 0, ErrCompacted
+			}
+		}
 		return term, err
 	}
 	return term, nil
