@@ -220,14 +220,11 @@ func (rn *RawNode) HasReady() bool {
 		Vote:   rn.Raft.Vote,
 		Commit: rn.Raft.RaftLog.committed,
 	}
-	if IsEmptyHardState(currentHardState) == true {
-		return false
-	}
 	// SoftState与HardState是否发生改变
 	if rn.prevSoftState.Lead != rn.Raft.Lead || rn.prevSoftState.RaftState != rn.Raft.State {
 		return true
 	}
-	if rn.prevHardState.Commit != rn.Raft.RaftLog.committed || rn.prevHardState.Term != rn.Raft.Term || rn.prevHardState.Vote != rn.Raft.Vote {
+	if IsEmptyHardState(currentHardState) == false && (rn.prevHardState.Commit != rn.Raft.RaftLog.committed || rn.prevHardState.Term != rn.Raft.Term || rn.prevHardState.Vote != rn.Raft.Vote) {
 		return true
 	}
 	// 其他因素是否改变

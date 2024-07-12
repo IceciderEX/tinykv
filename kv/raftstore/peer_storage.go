@@ -364,14 +364,12 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 	ps.applyState.AppliedIndex = snapshot.Metadata.Index
 	ps.applyState.TruncatedState.Index = snapshot.Metadata.Index
 	ps.applyState.TruncatedState.Term = snapshot.Metadata.Term
-
+	// you also need to update PeerStorage.snapState to snap.SnapState_Applying
+	ps.snapState.StateType = snap.SnapState_Applying
 	log.Info("ApplySnapshot: Index", snapshot.Metadata.Index, "Term", snapshot.Metadata.Term)
 
 	// raftWB.SetMeta(meta.RaftStateKey(snapData.Region.Id), ps.raftState)
 	kvWB.SetMeta(meta.ApplyStateKey(snapData.Region.Id), ps.applyState)
-
-	// you also need to update PeerStorage.snapState to snap.SnapState_Applying
-	ps.snapState.StateType = snap.SnapState_Applying
 
 	// 将 Snapshot 中的 KV 存储到底层
 	var notifier = make(chan bool, 1)
@@ -388,7 +386,7 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 		PrevRegion: ps.region,
 		Region:     snapData.Region,
 	}
-	// meta.WriteRegionState(kvWB, snapData.Region, rspb.PeerState_Normal)
+	meta.WriteRegionState(kvWB, snapData.Region, rspb.PeerState_Normal)
 	return result, nil
 }
 
@@ -424,7 +422,6 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 		return nil, err
 	}
 	wb.MustWriteToDB(ps.Engines.Raft)
-
 	return result, nil
 }
 

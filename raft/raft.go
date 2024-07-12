@@ -613,18 +613,26 @@ func (r *Raft) sendAppend(to uint64) bool {
 	// Your Code Here (2A).
 	prevLogIndex := r.Prs[to].Next - 1 // follower紧邻新日志条目之前的那个日志条目的索引
 	prevLogTerm, err := r.RaftLog.Term(prevLogIndex)
-	if r.RaftLog.LastIndex() < prevLogIndex {
-		return false
-	}
 	if err != nil {
-		log.Debug("sendAppend term err:", zap.String("err", err.Error()))
-		// snapshot send scenario
 		if errors.Is(err, ErrCompacted) {
+			fmt.Println("sendSnapShot from ", r.id, " to ", to)
+			// snapshot send scenario
 			r.sendSnapshot(to)
+			return false
 		}
-		return false
 	}
 
+	//firstIndex, _ := r.RaftLog.storage.FirstIndex()
+	//// 这通常发生在当领导人已经丢弃了下一条需要发送给跟随者的日志条目的时候
+	//if r.Prs[to].Next < firstIndex {
+	//	r.sendSnapshot(to)
+	//	return true
+	//}
+
+	// project2c bug fix
+	if prevLogIndex > r.RaftLog.LastIndex() {
+		return false
+	}
 	// 需要被保存的日志条目，发送所有在prevLog之后的log
 	entries := r.RaftLog.getPartEntries(prevLogIndex+1, r.RaftLog.LastIndex()+1)
 	// fmt.Println("sendAppend:", prevLogIndex, " ", r.RaftLog.LastIndex()+1)
@@ -901,17 +909,13 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 	r.RaftLog.applied = snapshot.Metadata.Index
 	r.RaftLog.stabled = snapshot.Metadata.Index
 	r.RaftLog.entryFirstIdx = snapshot.Metadata.Index + 1
-	r.RaftLog.LastIndex()
 
 	r.RaftLog.pendingSnapshot = snapshot
 	// ConfState contains the current membership information of the raft group
 	// 根据其中的 ConfState 更新自己的 Prs 信息
 	r.Prs = make(map[uint64]*Progress)
 	for _, id := range snapshot.Metadata.ConfState.Nodes {
-		r.Prs[id] = &Progress{
-			Match: None,
-			Next:  snapshot.Metadata.Index + 1,
-		}
+		r.Prs[id] = &Progress{}
 	}
 	r.sendSnapResponse(m.From, false, snapshot.Metadata.Index)
 }

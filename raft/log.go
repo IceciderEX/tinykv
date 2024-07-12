@@ -111,9 +111,11 @@ func (l *RaftLog) maybeCompact() {
 		panic("maybeCompact err: " + err.Error())
 	}
 	if compactIndex > l.entryFirstIdx {
-		l.entries = l.entries[compactIndex-l.entryFirstIdx:]
+		if len(l.entries) > 1 {
+			l.entries = l.entries[compactIndex-l.entryFirstIdx:]
+		}
 		// l.pendingSnapshot = nil
-		l.entryFirstIdx = compactIndex + 1
+		l.entryFirstIdx = compactIndex
 	}
 }
 
@@ -181,11 +183,15 @@ func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 // LastIndex return the last index of the log entries
 func (l *RaftLog) LastIndex() uint64 {
 	// Your Code Here (2A).
+	var snapIndex uint64
+	if IsEmptySnap(l.pendingSnapshot) == false {
+		snapIndex = l.pendingSnapshot.Metadata.Index
+	}
 	if len(l.entries) == 0 {
 		// snapshot handle
-		if IsEmptySnap(l.pendingSnapshot) == false {
-			return l.pendingSnapshot.Metadata.Index
-		}
+		//if IsEmptySnap(l.pendingSnapshot) == false {
+		//	return l.pendingSnapshot.Metadata.Index
+		//}
 		// entries为空，需要取值为storage的firstIndex-1
 		lastIdx, err := l.storage.FirstIndex()
 		log.Debug("storage last:%v\n", zap.Uint64("last", lastIdx))
@@ -193,11 +199,11 @@ func (l *RaftLog) LastIndex() uint64 {
 			fmt.Println(fmt.Errorf(err.Error()))
 			return 0
 		} else {
-			return lastIdx - 1
+			return max(lastIdx-1, snapIndex)
 		}
 	} else {
 		// fmt.Printf("entries last:%v\n", l.entries[len(l.entries)-1].Index)
-		return l.entries[len(l.entries)-1].Index
+		return max(snapIndex, l.entries[len(l.entries)-1].Index)
 	}
 }
 
