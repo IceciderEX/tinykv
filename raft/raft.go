@@ -620,6 +620,7 @@ func (r *Raft) sendAppend(to uint64) bool {
 			r.sendSnapshot(to)
 			return false
 		}
+		return false
 	}
 
 	//firstIndex, _ := r.RaftLog.storage.FirstIndex()
@@ -629,7 +630,7 @@ func (r *Raft) sendAppend(to uint64) bool {
 	//	return true
 	//}
 
-	// project2c bug fix
+	// project2c bug fix, getPartEntries之前先判断prevLogIndex与LastIndex的关系
 	if prevLogIndex > r.RaftLog.LastIndex() {
 		return false
 	}

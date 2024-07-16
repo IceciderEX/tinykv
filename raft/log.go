@@ -88,6 +88,7 @@ func newLog(storage Storage) *RaftLog {
 	nLog.committed = hardState.Commit
 	nLog.applied = firstIdx - 1
 	nLog.stabled = lastIdx
+	// entryFirstIdx: entries数组第一个entry的Index
 	nLog.entryFirstIdx = firstIdx
 	// get all entries that have not yet compact, 初始化为storage中已经持久化的entry
 	nLog.entries, err = storage.Entries(firstIdx, lastIdx+1)
@@ -106,15 +107,17 @@ func (l *RaftLog) maybeCompact() {
 	if len(l.entries) == 0 {
 		return
 	}
+	// trunc index + 1
 	compactIndex, err := l.storage.FirstIndex()
 	if err != nil {
 		panic("maybeCompact err: " + err.Error())
 	}
 	if compactIndex > l.entryFirstIdx {
+		// compact the log entries
 		if len(l.entries) > 1 {
 			l.entries = l.entries[compactIndex-l.entryFirstIdx:]
 		}
-		// l.pendingSnapshot = nil
+		l.pendingSnapshot = nil
 		l.entryFirstIdx = compactIndex
 	}
 }

@@ -197,7 +197,7 @@ func (d *peerMsgHandler) applyToDbAndRespond(entry eraftpb.Entry, wb *engine_uti
 			// After that, you should schedule a task to raftlog-gc worker by ScheduleCompactLog.
 			// Raftlog-gc worker will do the actual log deletion work asynchronously
 			// compactLog
-			fmt.Println("applyToDbAndRespond Compact Log")
+			// fmt.Println("applyToDbAndRespond Compact Log")
 			compactLog := msg.AdminRequest.CompactLog
 			if compactLog.CompactIndex >= d.peerStorage.applyState.TruncatedState.Index {
 				// TruncatedState: Record the index and term of the last raft log that have been truncated. (Used in 2C)

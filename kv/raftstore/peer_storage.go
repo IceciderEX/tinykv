@@ -368,7 +368,6 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 	ps.snapState.StateType = snap.SnapState_Applying
 	log.Info("ApplySnapshot: Index", snapshot.Metadata.Index, "Term", snapshot.Metadata.Term)
 
-	// raftWB.SetMeta(meta.RaftStateKey(snapData.Region.Id), ps.raftState)
 	kvWB.SetMeta(meta.ApplyStateKey(snapData.Region.Id), ps.applyState)
 
 	// 将 Snapshot 中的 KV 存储到底层
