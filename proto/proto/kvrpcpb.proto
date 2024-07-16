@@ -86,11 +86,17 @@ message GetResponse {
 // request succeeds if none of the keys are locked. In that case all those keys will
 // be locked. If the prewrite fails, no changes are made to the DB.
 message PrewriteRequest {
+    // Context 包含了与事务相关的元数据，例如事务所属的区域（Region）、请求优先级、隔离级别等信息。
+    // 这些信息有助于确保事务在正确的上下文中执行。
     Context context = 1;
+    // 存储事务中所有要修改的键值对, put/del/rollback (key, value)
     repeated Mutation mutations = 2;
     // Key of the primary lock.
     bytes primary_lock = 3;
+    // start ts
     uint64 start_version = 4;
+    // 锁的生存时间表示事务可以保持锁的最大时间。这个时间是为了防止死锁或长时间占用资源。
+    // 如果锁超时未被提交或回滚，系统可以进行适当的处理（如强制回滚），以释放资源。
     uint64 lock_ttl = 5;
 }
 
