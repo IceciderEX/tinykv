@@ -474,7 +474,10 @@ func (server *Server) KvResolveLock(_ context.Context, req *kvrpcpb.ResolveLockR
 				newReq.Keys = append(newReq.Keys, key)
 			}
 		}
-		server.KvBatchRollback(context.TODO(), newReq)
+		_, err = server.KvBatchRollback(context.TODO(), newReq)
+		if err != nil {
+			return nil, err
+		}
 	} else {
 		// If commit_version is greater than 0 it will commit those locks with the given commit timestamp
 		newReq := &kvrpcpb.CommitRequest{
@@ -496,7 +499,10 @@ func (server *Server) KvResolveLock(_ context.Context, req *kvrpcpb.ResolveLockR
 				newReq.Keys = append(newReq.Keys, key)
 			}
 		}
-		server.KvCommit(context.TODO(), newReq)
+		_, err = server.KvCommit(context.TODO(), newReq)
+		if err != nil {
+			return nil, err
+		}
 	}
 	return resp, nil
 }
