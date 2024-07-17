@@ -172,6 +172,18 @@ func (txn *MvccTxn) DeleteValue(key []byte) {
 	txn.writes = append(txn.writes, newDeleteValue)
 }
 
+func (txn *MvccTxn) Rollback(key []byte, startTs uint64, deleteLock bool) {
+	rollback := Write{
+		StartTS: startTs,
+		Kind:    WriteKindRollback,
+	}
+	txn.PutWrite(key, startTs, &rollback)
+	txn.DeleteValue(key)
+	if deleteLock == true {
+		txn.DeleteLock(key)
+	}
+}
+
 // CurrentWrite searches for a 'write record' with this transaction's start timestamp. It returns a Write from the DB and that
 // write's commit timestamp, or an error.
 func (txn *MvccTxn) CurrentWrite(key []byte) (*Write, uint64, error) {
@@ -196,9 +208,7 @@ func (txn *MvccTxn) CurrentWrite(key []byte) (*Write, uint64, error) {
 			return nil, 0, err
 		}
 		if write.StartTS == txn.StartTS {
-			if commitTs > write.StartTS {
-				return write, commitTs, nil
-			}
+			return write, commitTs, nil
 		}
 	}
 	return nil, 0, nil
@@ -226,7 +236,6 @@ func (txn *MvccTxn) MostRecentWrite(key []byte) (*Write, uint64, error) {
 			return nil, 0, err
 		}
 		write, err := ParseWrite(value)
-
 		if err != nil {
 			return nil, 0, err
 		}
