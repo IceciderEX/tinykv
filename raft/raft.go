@@ -240,6 +240,7 @@ func (r *Raft) tick() {
 }
 
 func (r *Raft) getNewElectionTick() {
+	// fmt.Println("id", r.id, "timeout", r.electionTimeout)
 	r.randElectionTimeout = r.electionTimeout + rand.Intn(r.electionTimeout)
 }
 
@@ -422,6 +423,7 @@ func (r *Raft) becomeFollower(term uint64, lead uint64) {
 	r.Term = term
 	r.electionElapsed = 0
 	r.heartbeatElapsed = 0
+	r.leadTransferee = 0
 	r.getNewElectionTick()
 }
 
@@ -440,6 +442,7 @@ func (r *Raft) becomeCandidate() {
 	r.votes[r.id] = true
 	r.electionElapsed = 0
 	r.heartbeatElapsed = 0
+	r.leadTransferee = 0
 	r.getNewElectionTick()
 }
 
@@ -451,6 +454,7 @@ func (r *Raft) becomeLeader() {
 	r.Lead = r.id
 	r.electionElapsed = 0
 	r.heartbeatElapsed = 0
+	r.leadTransferee = 0
 	r.getNewElectionTick()
 	// 当一个领导人刚获得权力的时候，他初始化所有的 nextIndex 值为自己的最后一条日志的 index 加 1
 	for peer := range r.Prs {
@@ -478,6 +482,10 @@ func (r *Raft) becomeLeader() {
 func (r *Raft) Step(m pb.Message) error {
 	// Your Code Here (2A).
 	// fmt.Printf("entering...\n")
+	if r.Prs[r.id] == nil {
+		return nil
+	}
+
 	switch r.State {
 	case StateFollower:
 		r.stepForFollower(m)
@@ -509,6 +517,10 @@ func (r *Raft) stepForFollower(m pb.Message) {
 		r.handleHeartbeat(m)
 	//case pb.MessageType_MsgHeartbeatResponse:
 	case pb.MessageType_MsgTransferLeader:
+		if r.Lead != None {
+			m.To = r.Lead
+			r.msgs = append(r.msgs, m)
+		}
 	case pb.MessageType_MsgTimeoutNow:
 		r.startCampaign()
 	}
@@ -548,7 +560,10 @@ func (r *Raft) stepForLeader(m pb.Message) {
 	case pb.MessageType_MsgBeat:
 		r.broadcastHeartbeat()
 	case pb.MessageType_MsgPropose:
-		r.HandlePropose(m)
+		// 3A: don't accept any propose when transfer leader
+		if r.leadTransferee == None {
+			r.HandlePropose(m)
+		}
 	case pb.MessageType_MsgAppend:
 		r.handleAppendEntries(m)
 	case pb.MessageType_MsgAppendResponse:
@@ -562,6 +577,7 @@ func (r *Raft) stepForLeader(m pb.Message) {
 	case pb.MessageType_MsgHeartbeatResponse:
 		r.handleHeartbeatResponse(m)
 	case pb.MessageType_MsgTransferLeader:
+		r.handleTransferLeader(m)
 	case pb.MessageType_MsgTimeoutNow:
 	}
 }
@@ -572,12 +588,24 @@ func (r *Raft) HandlePropose(m pb.Message) {
 	if len(entries) == 0 {
 		return
 	}
+
+	//// add conf change handle
+	//if len(entries) == 1 {
+	//	if entries[0].EntryType == pb.EntryType_EntryConfChange {
+	//		// you must apply it through RawNode.ApplyConfChange with the pb.ConfChange in the entry
+	//		// entry data is pb.ConfChange type
+	//
+	//		// only then you can add or remove peer to this raft node through raft.Raft.addNode
+	//		// and raft.Raft.removeNode according to the pb.ConfChange
+	//	}
+	//}
+
 	// 注意，propose的信息只有data信息，其他信息需要自己补充
 	for _, entry := range entries {
 		log.Debug("propose append entry Data:%v\n", zap.String("data", string(entry.Data)))
 		// r.RaftLog.entries = append(r.RaftLog.entries, *entry)
 		appEntry := pb.Entry{
-			EntryType: pb.EntryType_EntryNormal,
+			EntryType: entry.EntryType,
 			Term:      r.Term,
 			Index:     r.RaftLog.LastIndex() + 1,
 			Data:      entry.Data,
@@ -771,6 +799,11 @@ func (r *Raft) handleAppendResponse(message pb.Message) {
 		r.sendAppend(message.From)
 		return
 	}
+
+	// 3A, after sendAppend judge whether qualified
+	if message.From == r.leadTransferee && message.Index == r.RaftLog.LastIndex() {
+		r.sendTimeoutNow(r.leadTransferee)
+	}
 }
 
 // sendHeartbeat sends a heartbeat RPC to the given peer.
@@ -933,12 +966,64 @@ func (r *Raft) sendSnapResponse(to uint64, reject bool, index uint64) {
 	r.msgs = append(r.msgs, msg)
 }
 
+// handleTransferLeader
+func (r *Raft) handleTransferLeader(message pb.Message) {
+	transferee := message.From
+	if transferee == None || transferee == r.id {
+		return
+	}
+	if transferee == r.leadTransferee {
+		return
+	}
+	if transferee < 0 || transferee > uint64(len(r.Prs)) {
+		return
+	}
+	r.leadTransferee = transferee
+	r.electionElapsed = 0
+	// the current leader should first check the qualification of the transferee (namely transfer target) like:
+	// is the transferee’s log up to date, etc
+	if r.Prs[transferee].Match >= r.RaftLog.LastIndex() {
+		// if the transferee is qualified (or after the current leader’s help), the leader should send a MsgTimeoutNow message to the transferee immediately,
+		// and after receiving a MsgTimeoutNow message the transferee should start a new election immediately regardless of its election timeout,
+		// with a higher term and up to date log, the transferee has great chance to step down the current leader and become the new leader
+		r.sendTimeoutNow(transferee)
+	} else {
+		// If the transferee’s log is not up to date, the current leader should 'send a MsgAppend message to the transferee'
+		// and 'stop accepting new proposals' in case we end up cycling
+		// fmt.Println("trans log not up to date", transferee)
+		r.sendAppend(transferee)
+	}
+}
+
+// sendTimeoutNow send timeout msg to peer to
+func (r *Raft) sendTimeoutNow(to uint64) {
+	msg := pb.Message{
+		MsgType: pb.MessageType_MsgTimeoutNow,
+		From:    r.id,
+		To:      to,
+	}
+	r.msgs = append(r.msgs, msg)
+}
+
 // addNode add a new node to raft group
 func (r *Raft) addNode(id uint64) {
 	// Your Code Here (3A).
+	if id < 0 || r.Prs[id] != nil {
+		return
+	}
+	r.Prs[id] = &Progress{
+		Match: 0,
+		Next:  0,
+	}
 }
 
 // removeNode remove a node from raft group
 func (r *Raft) removeNode(id uint64) {
 	// Your Code Here (3A).
+	if r.Prs[id] != nil {
+		delete(r.Prs, id)
+		if r.State == StateLeader {
+			r.maybeCommit()
+		}
+	}
 }
