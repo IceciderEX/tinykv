@@ -1,39 +1,23 @@
 # TinyKV
 
 #### 介绍
-{**以下是 Gitee 平台说明，您可以替换此简介**
-Gitee 是 OSCHINA 推出的基于 Git 的代码托管平台（同时支持 SVN）。专为开发者提供稳定、高效、安全的云端软件开发协作平台
-无论是个人、团队、或是企业，都能够用 Gitee 实现代码托管、项目管理、协作开发。企业项目请看 [https://gitee.com/enterprises](https://gitee.com/enterprises)}
-
-#### 软件架构
-软件架构说明
+此仓库为PingCAP TalentPlan的TinyKV的实现。
 
 
-#### 安装教程
+TinyKV 是一个用于学习分布式系统和存储系统原理的小型项目。它是基于 Go 语言实现的，目标是帮助开发者理解现代分布式数据库的核心概念和实现。TinyKV 项目源自于 TiKV，这是一个开源的、分布式的、支持事务的 NoSQL 数据库。TinyKV 通过简化和分阶段实现 TiKV 的核心功能，使得学习和实践分布式系统变得更加可行和高效。
 
-1.  xxxx
-2.  xxxx
-3.  xxxx
+### TinyKV 的主要特点和功能
 
-#### 使用说明
+1. **简化的架构**：TinyKV 采用了简化的架构，使得初学者能够更容易地理解分布式存储系统的基础原理。
 
-1.  xxxx
-2.  xxxx
-3.  xxxx
+2. **分阶段实现**：TinyKV 被设计为一个逐步实现的项目，分为多个项目阶段（如 Project 1、Project 2、Project 3 等），每个阶段都聚焦于一个特定的功能或概念。
+   - **Project 1**：实现基于内存的 key-value 存储。
+   - **Project 2**：引入 Raft 一致性算法，实现高可用性。
+   - **Project 3**：实现多 Raft 组和 Region 管理。
+   - **Project 4**：实现分布式事务。
 
-#### 参与贡献
+3. **Raft 一致性算法**：TinyKV 包含了 Raft 算法的实现，这是一个分布式一致性算法，用于保证在存在故障的情况下，集群中数据的一致性和可用性。
 
-1.  Fork 本仓库
-2.  新建 Feat_xxx 分支
-3.  提交代码
-4.  新建 Pull Request
+4. **事务支持**：通过实现分布式事务，TinyKV 能够支持 ACID 特性的事务操作，确保数据的一致性和完整性。
 
-
-#### 特技
-
-1.  使用 Readme\_XXX.md 来支持不同的语言，例如 Readme\_en.md, Readme\_zh.md
-2.  Gitee 官方博客 [blog.gitee.com](https://blog.gitee.com)
-3.  你可以 [https://gitee.com/explore](https://gitee.com/explore) 这个地址来了解 Gitee 上的优秀开源项目
-4.  [GVP](https://gitee.com/gvp) 全称是 Gitee 最有价值开源项目，是综合评定出的优秀开源项目
-5.  Gitee 官方提供的使用手册 [https://gitee.com/help](https://gitee.com/help)
-6.  Gitee 封面人物是一档用来展示 Gitee 会员风采的栏目 [https://gitee.com/gitee-stars/](https://gitee.com/gitee-stars/)
+实现可见course分支，文档还未上传。
