@@ -18,7 +18,8 @@ import (
 	"errors"
 	"fmt"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
-	"github.com/pingcap/log"
+	// "github.com/pingcap/log"
+	"github.com/pingcap-incubator/tinykv/log"
 	"go.uber.org/zap"
 	"math/rand"
 )
@@ -198,7 +199,10 @@ func newRaft(c *Config) *Raft {
 	if c.peers == nil {
 		c.peers = confState.Nodes
 	}
+	log.Debugf("newRaft id: %v", c.ID)
+	log.Debugf("newRaft peers: %v", c.peers)
 	// fmt.Printf("peer size %v\n", len(c.peers))
+	nRaft.Prs[nRaft.id] = &Progress{Match: nRaft.RaftLog.LastIndex(), Next: nRaft.RaftLog.LastIndex() + 1}
 	for _, id := range c.peers {
 		nRaft.Prs[id] = new(Progress)
 		if id == c.ID {
@@ -483,6 +487,7 @@ func (r *Raft) Step(m pb.Message) error {
 	// Your Code Here (2A).
 	// fmt.Printf("entering...\n")
 	if r.Prs[r.id] == nil {
+		fmt.Println("this peer not in Peers: ", m.To, "msg:", m)
 		return nil
 	}
 
@@ -604,6 +609,16 @@ func (r *Raft) HandlePropose(m pb.Message) {
 	for _, entry := range entries {
 		log.Debug("propose append entry Data:%v\n", zap.String("data", string(entry.Data)))
 		// r.RaftLog.entries = append(r.RaftLog.entries, *entry)
+
+		// PendingConfIndex, which
+		// is set to a value >= the log index of the latest pending
+		// configuration change (if any)
+		if entry.EntryType == pb.EntryType_EntryConfChange {
+			if r.PendingConfIndex != None {
+				continue
+			}
+			r.PendingConfIndex = entry.Index
+		}
 		appEntry := pb.Entry{
 			EntryType: entry.EntryType,
 			Term:      r.Term,
@@ -822,7 +837,7 @@ func (r *Raft) sendHeartbeat(to uint64) {
 		MsgType: pb.MessageType_MsgHeartbeat,
 		From:    r.id,
 		Term:    r.Term,
-		Commit:  min(r.RaftLog.committed, r.Prs[r.id].Match),
+		Commit:  min(r.RaftLog.committed, r.Prs[to].Match),
 		To:      to,
 	}
 	r.msgs = append(r.msgs, msg)
@@ -975,10 +990,11 @@ func (r *Raft) handleTransferLeader(message pb.Message) {
 	if transferee == r.leadTransferee {
 		return
 	}
-	if transferee < 0 || transferee > uint64(len(r.Prs)) {
+	if transferee < 0 {
 		return
 	}
 	r.leadTransferee = transferee
+	// todo :如果在一个 electionTimeout 时间内都没有转移成功，则放弃本次转移，重置 leadTransferee
 	r.electionElapsed = 0
 	// the current leader should first check the qualification of the transferee (namely transfer target) like:
 	// is the transferee’s log up to date, etc
@@ -1008,18 +1024,22 @@ func (r *Raft) sendTimeoutNow(to uint64) {
 // addNode add a new node to raft group
 func (r *Raft) addNode(id uint64) {
 	// Your Code Here (3A).
+	r.PendingConfIndex = None
 	if id < 0 || r.Prs[id] != nil {
 		return
 	}
+	log.Infof("addNode: %v", id)
 	r.Prs[id] = &Progress{
 		Match: 0,
-		Next:  0,
+		Next:  1,
 	}
+	log.Infof("addNode Prs: %v %v", r.Prs[id].Match, r.Prs[id].Next)
 }
 
 // removeNode remove a node from raft group
 func (r *Raft) removeNode(id uint64) {
 	// Your Code Here (3A).
+	r.PendingConfIndex = None
 	if r.Prs[id] != nil {
 		delete(r.Prs, id)
 		if r.State == StateLeader {

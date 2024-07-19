@@ -360,6 +360,7 @@ func (server *Server) KvCheckTxnStatus(_ context.Context, req *kvrpcpb.CheckTxnS
 	if err != nil {
 		return nil, err
 	}
+	// if lock nil, rollback the secondary key
 	if lock == nil {
 		resp.Action = kvrpcpb.Action_LockNotExistRollback
 		mvccTxn.Rollback(req.PrimaryKey, req.LockTs, false)

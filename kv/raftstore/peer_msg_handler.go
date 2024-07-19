@@ -76,6 +76,7 @@ func (d *peerMsgHandler) HandleRaftReady() {
 			// process entry
 			// applies the committed entry to the state machine
 			d.processCommittedEntry(entry, wb)
+			// 3B add destroy peer
 			if d.stopped {
 				return
 			}
@@ -105,8 +106,90 @@ func (d *peerMsgHandler) processCommittedEntry(entry eraftpb.Entry, wb *engine_u
 		d.applyToDbAndRespond(entry, wb)
 		// wb.WriteToDB(d.peerStorage.Engines.Kv)
 	} else if entry.EntryType == eraftpb.EntryType_EntryConfChange {
+		// 测试代码会多次调度一个 conf 更改的命令，直到应用 conf 更改，因此您需要考虑如何忽略同一 conf 更改的重复命令。
+		// After the log is committed, change the RegionLocalState, including RegionEpoch and Peers in Region
+		confChange := &eraftpb.ConfChange{}
+		err := confChange.Unmarshal(entry.Data)
+		if err != nil {
+			fmt.Println("HandleRaftReady's confChange unmarshal error", err)
+		}
 
+		// fmt.Println("confChange: ", confChange)
+		// get peer info from the request (ctx)
+		peerInfo := &raft_cmdpb.RaftCmdRequest{}
+		err = peerInfo.Unmarshal(confChange.Context)
+		// fmt.Println("peerInfo: ", peerInfo)
+
+		// add region epoch check
+		err = util.CheckRegionEpoch(peerInfo, d.Region(), true)
+		if errEpochNotMatching, ok := err.(*util.ErrEpochNotMatch); ok {
+			if d.checkError(entry) == false {
+				if len(d.proposals) > 0 {
+					d.proposals = d.proposals[1:]
+				}
+			} else {
+				correspondingProposal := d.proposals[0]
+				correspondingProposal.cb.Done(ErrResp(errEpochNotMatching))
+			}
+		}
+
+		d.Region().RegionEpoch.ConfVer++
+		if confChange.ChangeType == eraftpb.ConfChangeType_AddNode {
+			// todo already in peer's judge?
+			d.Region().Peers = append(d.Region().Peers, peerInfo.AdminRequest.ChangePeer.Peer)
+			d.insertPeerCache(peerInfo.AdminRequest.ChangePeer.Peer)
+			log.Infof("processCommittedEntry addNode: %v", confChange.NodeId)
+		} else if confChange.ChangeType == eraftpb.ConfChangeType_RemoveNode {
+			// For executing RemoveNode, you should call the destroyPeer()
+			// explicitly to stop the Raft module. The destroy logic is provided for you.
+			if confChange.NodeId == d.peer.PeerId() {
+				d.destroyPeer()
+				return
+			}
+			for idx, peer := range d.Region().Peers {
+				// find the node need to be removed
+				if peer.Id == confChange.NodeId {
+					d.Region().Peers = append(d.Region().Peers[:idx], d.Region().Peers[idx+1:]...)
+				}
+			}
+			d.removePeerCache(confChange.NodeId)
+			log.Infof("processCommittedEntry removede: %v", confChange.NodeId)
+		}
+		for _, peer := range d.Region().Peers {
+			log.Infof("EntryConfChange now peers: %v", peer.Id)
+		}
+		// Call ApplyConfChange() of raft.RawNode
+		d.peer.RaftGroup.ApplyConfChange(*confChange)
+		// Do not forget to update the region state in storeMeta of GlobalContext
+		d.ctx.storeMeta.Lock()
+		// update the region state, include regions and regionRanges
+		d.ctx.storeMeta.regions[d.regionId] = d.Region()
+		d.ctx.storeMeta.regionRanges.ReplaceOrInsert(&regionItem{region: d.Region()})
+		d.ctx.storeMeta.Unlock()
+
+		// write RegionLocalState to DB
+		meta.WriteRegionState(wb, d.Region(), rspb.PeerState_Normal)
+
+		if d.checkError(entry) == false {
+			if len(d.proposals) > 0 {
+				d.proposals = d.proposals[1:]
+			}
+		} else {
+			correspondingProposal := d.proposals[0]
+			resp := raft_cmdpb.RaftCmdResponse{
+				Header: &raft_cmdpb.RaftResponseHeader{},
+				AdminResponse: &raft_cmdpb.AdminResponse{
+					CmdType:    raft_cmdpb.AdminCmdType_ChangePeer,
+					ChangePeer: &raft_cmdpb.ChangePeerResponse{},
+				},
+			}
+			correspondingProposal.cb.Done(&resp)
+		}
 	}
+}
+
+func (d *peerMsgHandler) proposalResponse(prop proposal) {
+
 }
 
 // applyToDB EntryNormal类型，执行entry解码出来的Requests中的4种操作，并响应Proposal
@@ -116,6 +199,7 @@ func (d *peerMsgHandler) applyToDbAndRespond(entry eraftpb.Entry, wb *engine_uti
 	if err != nil {
 		log.Error("HandleRaftReady's unmarshal error", fmt.Errorf(err.Error()))
 	}
+	log.Debugf("proposeRaftCommand new apply entry, peer %v, entry: %v", d.peer.PeerId(), entry)
 	cmdResponse := &raft_cmdpb.RaftCmdResponse{
 		Header:    &raft_cmdpb.RaftResponseHeader{},
 		Responses: []*raft_cmdpb.Response{},
@@ -138,6 +222,7 @@ func (d *peerMsgHandler) applyToDbAndRespond(entry eraftpb.Entry, wb *engine_uti
 			// len = 0, index not right, term not right
 			// 如果proposal检查无错误，那么选择这个proposal进行回应，否则忽略这个proposal
 			if d.checkError(entry) == false {
+				log.Debug("proposal checkError error, no resp")
 				if len(d.proposals) > 0 {
 					d.proposals = d.proposals[1:]
 				}
@@ -213,20 +298,37 @@ func (d *peerMsgHandler) applyToDbAndRespond(entry eraftpb.Entry, wb *engine_uti
 }
 
 func (d *peerMsgHandler) checkError(entry eraftpb.Entry) bool {
+	log.Debugf("check error, peer %v, entry: %v", d.peer.PeerId(), entry)
 	if len(d.proposals) > 0 {
+		// clear stale
+		for _, eachProposal := range d.proposals {
+			if eachProposal.index < entry.Index {
+				d.proposals = d.proposals[1:]
+			}
+		}
 		correspondingProposal := d.proposals[0]
+		d.printProposals(d.proposals)
 		if correspondingProposal.index == entry.Index {
 			if correspondingProposal.term != entry.Term { // 可能是由于领导者更改，某些日志未提交并被新领导者的日志覆盖
-				log.Error("callBackProposals Term unequal")
+				log.Infof("callBackProposals Term unequal")
 				NotifyStaleReq(entry.Term, correspondingProposal.cb)
 				return false
 			} else {
 				return true
 			}
 		}
+		log.Infof("correspondingProposal.index != entry.Index ")
 		return false
 	}
+	log.Infof("checkError len(d.proposals) == 0")
 	return false
+}
+
+func (d *peerMsgHandler) printProposals(proposals []*proposal) {
+	log.Debugf("all proposals len: %v", len(proposals))
+	for i, p := range proposals {
+		log.Debugf("Proposal %d: index=%d, term=%d, callback=%v", i, p.index, p.term, p.cb)
+	}
 }
 
 // HandleMsg processes all the messages received from raftCh
@@ -309,6 +411,7 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		cb.Done(ErrResp(err))
 		return
 	}
+	log.Debugf("proposeRaftCommand peer %v, msg %v", d.peer.PeerId(), msg)
 	// Your Code Here (2B).
 	// d.proposals Record the callback of the proposals
 	// We can't enclose normal requests and administrator request at same time.
@@ -330,11 +433,13 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 			log.Errorf("proposeRaftCommand err: " + err.Error())
 			cb.Done(ErrResp(err))
 		}
+		log.Debugf("proposeRaftCommand new normal req, peer %v", d.peer.PeerId())
 		d.proposals = append(d.proposals, prop)
 	} else if msg.AdminRequest != nil { // administrator request (如配置更改、成员管理等)
 		// snapshot
 		// request has: regionID, d.Meta, compactIdx, term
 		// 将 CompactLogRequest 请求 propose 到 Raft 中，等待 Raft Group 确认
+		log.Debugf("proposeRaftCommand new admin req, peer %v", d.peer.PeerId())
 		switch msg.AdminRequest.CmdType {
 		case raft_cmdpb.AdminCmdType_CompactLog:
 			data, err := msg.Marshal()
@@ -342,6 +447,44 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 				log.Errorf("proposeRaftCommand err: " + err.Error())
 			}
 			err = d.RaftGroup.Propose(data)
+			if err != nil {
+				log.Errorf("proposeRaftCommand err: " + err.Error())
+			}
+		case raft_cmdpb.AdminCmdType_TransferLeader:
+			// 3B add transfer leader admin cmd
+			// TransferLeader actually is an action with no need to replicate to other peers,
+			// so you just need to call the TransferLeader() method of RawNode instead of Propose() for TransferLeader command.
+			transferee := msg.AdminRequest.TransferLeader.Peer
+			d.peer.RaftGroup.TransferLeader(transferee.Id)
+			// response
+			adminResp := raft_cmdpb.AdminResponse{
+				CmdType:        raft_cmdpb.AdminCmdType_TransferLeader,
+				TransferLeader: &raft_cmdpb.TransferLeaderResponse{},
+			}
+			resp := raft_cmdpb.RaftCmdResponse{
+				Header:        &raft_cmdpb.RaftResponseHeader{},
+				AdminResponse: &adminResp,
+			}
+			cb.Done(&resp)
+		case raft_cmdpb.AdminCmdType_ChangePeer:
+			// Propose conf change admin command by ProposeConfChange
+			prop := &proposal{
+				index: d.nextProposalIndex(),
+				term:  d.Term(),
+				cb:    cb,
+			}
+			d.proposals = append(d.proposals, prop)
+			peerInfoCtx, err := msg.Marshal()
+			if err != nil {
+				log.Errorf("proposeRaftCommand marshal err: " + err.Error())
+			}
+			fmt.Println("eraftpb.ConfChange ctx:", peerInfoCtx)
+			confChange := eraftpb.ConfChange{
+				ChangeType: msg.AdminRequest.ChangePeer.ChangeType,
+				NodeId:     msg.AdminRequest.ChangePeer.Peer.Id,
+				Context:    peerInfoCtx, // todo Context's init: changePeer's info
+			}
+			err = d.RaftGroup.ProposeConfChange(confChange)
 			if err != nil {
 				log.Errorf("proposeRaftCommand err: " + err.Error())
 			}
@@ -412,6 +555,8 @@ func (d *peerMsgHandler) onRaftMsg(msg *rspb.RaftMessage) error {
 	log.Debugf("%s handle raft message %s from %d to %d",
 		d.Tag, msg.GetMessage().GetMsgType(), msg.GetFromPeer().GetId(), msg.GetToPeer().GetId())
 	if !d.validateRaftMessage(msg) {
+		log.Debugf("%s handle raft message %s from %d to %d invalid msg",
+			d.Tag, msg.GetMessage().GetMsgType(), msg.GetFromPeer().GetId(), msg.GetToPeer().GetId())
 		return nil
 	}
 	if d.stopped {
@@ -442,6 +587,8 @@ func (d *peerMsgHandler) onRaftMsg(msg *rspb.RaftMessage) error {
 		return nil
 	}
 	d.insertPeerCache(msg.GetFromPeer())
+	log.Debugf("%s handle raft message %s from %d to %d and step it",
+		d.Tag, msg.GetMessage().GetMsgType(), msg.GetFromPeer().GetId(), msg.GetToPeer().GetId())
 	err = d.RaftGroup.Step(*msg.GetMessage())
 	if err != nil {
 		return err
