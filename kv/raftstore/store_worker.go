@@ -98,6 +98,7 @@ func (d *storeWorker) start(store *metapb.Store) {
 // /
 // / Returns true means the message can be dropped silently.
 func (d *storeWorker) checkMsg(msg *rspb.RaftMessage) (bool, error) {
+	//log.Infof("storeWorker checkMsg: %v", msg)
 	regionID := msg.GetRegionId()
 	fromEpoch := msg.GetRegionEpoch()
 	msgType := msg.Message.MsgType
@@ -151,11 +152,11 @@ func (d *storeWorker) checkMsg(msg *rspb.RaftMessage) (bool, error) {
 
 func (d *storeWorker) onRaftMessage(msg *rspb.RaftMessage) error {
 	regionID := msg.RegionId
+	log.Debugf("handle raft message. from_peer:%d, to_peer:%d, store:%d, region:%d, msg:%+v",
+		msg.FromPeer.Id, msg.ToPeer.Id, d.storeState.id, regionID, msg.Message)
 	if err := d.ctx.router.send(regionID, message.Msg{Type: message.MsgTypeRaftMessage, Data: msg}); err == nil {
 		return nil
 	}
-	log.Debugf("handle raft message. from_peer:%d, to_peer:%d, store:%d, region:%d, msg:%+v",
-		msg.FromPeer.Id, msg.ToPeer.Id, d.storeState.id, regionID, msg.Message)
 	if msg.ToPeer.StoreId != d.ctx.store.Id {
 		log.Warnf("store not match, ignore it. store_id:%d, to_store_id:%d, region_id:%d",
 			d.ctx.store.Id, msg.ToPeer.StoreId, regionID)
@@ -196,6 +197,7 @@ func (d *storeWorker) onRaftMessage(msg *rspb.RaftMessage) error {
 func (d *storeWorker) maybeCreatePeer(regionID uint64, msg *rspb.RaftMessage) (bool, error) {
 	// we may encounter a message with larger peer id, which means
 	// current peer is stale, then we should remove current peer
+	log.Infof("enter maybeCreatePeer")
 	meta := d.ctx.storeMeta
 	meta.Lock()
 	defer meta.Unlock()
@@ -217,10 +219,11 @@ func (d *storeWorker) maybeCreatePeer(regionID uint64, msg *rspb.RaftMessage) (b
 		}
 		return false, nil
 	}
-
+	log.Infof("maybeCreatePeer try to replicatePeer")
 	peer, err := replicatePeer(
 		d.ctx.store.Id, d.ctx.cfg, d.ctx.regionTaskSender, d.ctx.engine, regionID, msg.ToPeer)
 	if err != nil {
+		log.Infof("maybeCreatePeer replicatePeer error")
 		return false, err
 	}
 	log.Debugf("replicatePeer success, peer %v store: %v", msg.ToPeer, d.ctx.store.Id)

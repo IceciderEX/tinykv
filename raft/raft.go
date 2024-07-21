@@ -202,7 +202,7 @@ func newRaft(c *Config) *Raft {
 	log.Debugf("newRaft id: %v", c.ID)
 	log.Debugf("newRaft peers: %v", c.peers)
 	// fmt.Printf("peer size %v\n", len(c.peers))
-	nRaft.Prs[nRaft.id] = &Progress{Match: nRaft.RaftLog.LastIndex(), Next: nRaft.RaftLog.LastIndex() + 1}
+	//nRaft.Prs[nRaft.id] = &Progress{Match: nRaft.RaftLog.LastIndex(), Next: nRaft.RaftLog.LastIndex() + 1}
 	for _, id := range c.peers {
 		nRaft.Prs[id] = new(Progress)
 		if id == c.ID {
@@ -232,6 +232,14 @@ func (r *Raft) tick() {
 		if r.heartbeatElapsed >= r.heartbeatTimeout {
 			r.heartbeatElapsed = 0
 			r.broadcastHeartbeat()
+		}
+		if r.leadTransferee != None {
+			r.electionElapsed++
+			if r.electionElapsed >= r.randElectionTimeout {
+				r.leadTransferee = None
+				r.electionElapsed = 0
+				r.randElectionTimeout = r.electionTimeout + rand.Intn(r.electionTimeout)
+			}
 		}
 	} else {
 		r.electionElapsed++
@@ -427,6 +435,7 @@ func (r *Raft) becomeFollower(term uint64, lead uint64) {
 	r.Term = term
 	r.electionElapsed = 0
 	r.heartbeatElapsed = 0
+	// when leader become follower, leadTransferee = None
 	r.leadTransferee = 0
 	r.getNewElectionTick()
 }
@@ -446,7 +455,6 @@ func (r *Raft) becomeCandidate() {
 	r.votes[r.id] = true
 	r.electionElapsed = 0
 	r.heartbeatElapsed = 0
-	r.leadTransferee = 0
 	r.getNewElectionTick()
 }
 
@@ -458,7 +466,6 @@ func (r *Raft) becomeLeader() {
 	r.Lead = r.id
 	r.electionElapsed = 0
 	r.heartbeatElapsed = 0
-	r.leadTransferee = 0
 	r.getNewElectionTick()
 	// 当一个领导人刚获得权力的时候，他初始化所有的 nextIndex 值为自己的最后一条日志的 index 加 1
 	for peer := range r.Prs {
@@ -481,16 +488,23 @@ func (r *Raft) becomeLeader() {
 	r.maybeCommit()
 }
 
+func (r *Raft) isCampaignRelated(m pb.Message) bool {
+	if m.MsgType == pb.MessageType_MsgTimeoutNow {
+		return true
+	} else {
+		return false
+	}
+}
+
 // Step the entrance of handle message, see `MessageType`
 // on `eraftpb.proto` for what msgs should be handled
 func (r *Raft) Step(m pb.Message) error {
 	// Your Code Here (2A).
-	// fmt.Printf("entering...\n")
-	if r.Prs[r.id] == nil {
+	// 对于Raft节点不在集群当中（尚未初始化）的情况，只能屏蔽选举相关的消息
+	if _, exist := r.Prs[r.id]; !exist && r.isCampaignRelated(m) {
 		fmt.Println("this peer not in Peers: ", m.To, "msg:", m)
 		return nil
 	}
-
 	switch r.State {
 	case StateFollower:
 		r.stepForFollower(m)
@@ -510,6 +524,10 @@ func (r *Raft) stepForFollower(m pb.Message) {
 		r.startCampaign()
 	// case pb.MessageType_MsgBeat:
 	case pb.MessageType_MsgPropose: // 如果当前没有leader存在,忽略这类消息；否则转发给leader
+		if r.Lead != None {
+			m.To = r.Lead
+			r.msgs = append(r.msgs, m)
+		}
 	case pb.MessageType_MsgAppend:
 		r.handleAppendEntries(m)
 	// case pb.MessageType_MsgAppendResponse:
@@ -540,7 +558,11 @@ func (r *Raft) stepForCandidate(m pb.Message) {
 	case pb.MessageType_MsgHup:
 		r.startCampaign()
 	// case pb.MessageType_MsgBeat:
-	case pb.MessageType_MsgPropose: // 如果当前没有leader存在,忽略这类消息；否则转发给leade
+	case pb.MessageType_MsgPropose: // 如果当前没有leader存在,忽略这类消息；否则转发给leader
+		if r.Lead != None {
+			m.To = r.Lead
+			r.msgs = append(r.msgs, m)
+		}
 	case pb.MessageType_MsgAppend:
 		r.handleAppendEntries(m)
 	// case pb.MessageType_MsgAppendResponse:
@@ -584,6 +606,7 @@ func (r *Raft) stepForLeader(m pb.Message) {
 	case pb.MessageType_MsgTransferLeader:
 		r.handleTransferLeader(m)
 	case pb.MessageType_MsgTimeoutNow:
+		r.handleLeaderTimeout()
 	}
 }
 
@@ -809,15 +832,14 @@ func (r *Raft) handleAppendResponse(message pb.Message) {
 		// fmt.Printf("index: %v % v\n", message.Index, r.RaftLog.LastIndex())
 		// 检查当前有哪些日志是超过半数的节点同意的，再将这些可以提交（commit）的数据广播出去
 		r.maybeCommit()
+		// 3A, after sendAppend judge whether qualified
+		if message.From == r.leadTransferee && message.Index == r.RaftLog.LastIndex() {
+			r.sendTimeoutNow(r.leadTransferee)
+		}
 	} else if r.Prs[message.From].Next > 0 { // 减小 nextIndex 值并进行重试append
 		r.Prs[message.From].Next -= 1 // message中为lastIndex?
 		r.sendAppend(message.From)
 		return
-	}
-
-	// 3A, after sendAppend judge whether qualified
-	if message.From == r.leadTransferee && message.Index == r.RaftLog.LastIndex() {
-		r.sendTimeoutNow(r.leadTransferee)
 	}
 }
 
@@ -839,6 +861,9 @@ func (r *Raft) sendHeartbeat(to uint64) {
 		Term:    r.Term,
 		Commit:  min(r.RaftLog.committed, r.Prs[to].Match),
 		To:      to,
+	}
+	if r.id == 5 && to == 1 {
+		log.Debugf("sendHeartbeat commit debug %v, all: %v", msg.Commit, msg)
 	}
 	r.msgs = append(r.msgs, msg)
 }
@@ -895,12 +920,13 @@ func (r *Raft) startCampaign() {
 	r.sendRequestVote()
 }
 
-// handleTimeout timeout消息，目标节点收到该消息，即刻自增term并发起选举
-func (r *Raft) handleTimeout(m pb.Message) {
-	r.Term = r.Term + 1
-	r.startCampaign()
-	r.electionElapsed = 0
-	r.heartbeatElapsed = 0
+// handleLeaderTimeout
+func (r *Raft) handleLeaderTimeout() {
+	log.Debugf("current timeElapsed: %v %v", r.electionElapsed, r.heartbeatElapsed)
+	if r.leadTransferee != None {
+		r.leadTransferee = None
+		r.electionTimeout = 0
+	}
 }
 
 // sendSnapshot send Snapshot RPC request
@@ -984,17 +1010,19 @@ func (r *Raft) sendSnapResponse(to uint64, reject bool, index uint64) {
 // handleTransferLeader
 func (r *Raft) handleTransferLeader(message pb.Message) {
 	transferee := message.From
-	if transferee == None || transferee == r.id {
+	if transferee == None || transferee == r.id || transferee < 0 {
 		return
 	}
 	if transferee == r.leadTransferee {
 		return
 	}
-	if transferee < 0 {
+	if _, exist := r.Prs[transferee]; !exist {
 		return
 	}
+
+	// overlay before transferee
 	r.leadTransferee = transferee
-	// todo :如果在一个 electionTimeout 时间内都没有转移成功，则放弃本次转移，重置 leadTransferee
+	// 如果在一个 electionTimeout 时间内都没有转移成功，则放弃本次转移，重置 leadTransferee(tick func)
 	r.electionElapsed = 0
 	// the current leader should first check the qualification of the transferee (namely transfer target) like:
 	// is the transferee’s log up to date, etc
@@ -1028,22 +1056,24 @@ func (r *Raft) addNode(id uint64) {
 	if id < 0 || r.Prs[id] != nil {
 		return
 	}
-	log.Infof("addNode: %v", id)
+	log.Infof("node %v do addNode: %v", r.id, id)
 	r.Prs[id] = &Progress{
 		Match: 0,
 		Next:  1,
 	}
-	log.Infof("addNode Prs: %v %v", r.Prs[id].Match, r.Prs[id].Next)
+	log.Infof("node %v after addNode peers: %v", r.id, r.Prs)
 }
 
 // removeNode remove a node from raft group
 func (r *Raft) removeNode(id uint64) {
 	// Your Code Here (3A).
 	r.PendingConfIndex = None
+	log.Infof("node %v do deleteNode: %v", r.id, id)
 	if r.Prs[id] != nil {
 		delete(r.Prs, id)
 		if r.State == StateLeader {
 			r.maybeCommit()
 		}
 	}
+	log.Infof("node %v after deleteNode peers: %v", r.id, r.Prs)
 }

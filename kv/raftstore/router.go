@@ -86,6 +86,7 @@ func (r *RaftstoreRouter) Send(regionID uint64, msg message.Msg) error {
 }
 
 func (r *RaftstoreRouter) SendRaftMessage(msg *raft_serverpb.RaftMessage) error {
+	// log.Debug("Router.go SendRaftMessage: ", msg)
 	regionID := msg.RegionId
 	if r.router.send(regionID, message.NewPeerMsg(message.MsgTypeRaftMessage, regionID, msg)) != nil {
 		r.router.sendStore(message.NewPeerMsg(message.MsgTypeStoreRaftMessage, regionID, msg))

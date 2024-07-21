@@ -5,6 +5,8 @@ import (
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/meta"
 	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+	"github.com/pingcap-incubator/tinykv/raft"
+	"reflect"
 	"time"
 
 	"github.com/Connor1996/badger/y"
@@ -52,12 +54,24 @@ func (d *peerMsgHandler) HandleRaftReady() {
 	// Your Code Here (2B).
 	// get the ready from Raft module
 	if d.RaftGroup.HasReady() {
+		log.Debugf("peer %v has raft ready", d.PeerId())
 		ready := d.RaftGroup.Ready()
 		// use the provided method SaveReadyState() to persist the Raft related states
-		_, err := d.peerStorage.SaveReadyState(&ready)
+		snapShotResult, err := d.peerStorage.SaveReadyState(&ready)
 		if err != nil {
-			fmt.Println("HandleRaftReady's error", fmt.Errorf(err.Error()))
+			fmt.Println("HandleRaftReady SaveReadyState error", fmt.Errorf(err.Error()))
 			return
+		}
+		// region update: snapshot's region apply
+		if snapShotResult != nil && !reflect.DeepEqual(snapShotResult.PrevRegion, snapShotResult.Region) {
+			currentRegion := snapShotResult.Region
+			prevRegion := snapShotResult.PrevRegion
+			d.peerStorage.region = currentRegion
+			d.ctx.storeMeta.Lock()
+			d.ctx.storeMeta.regions[currentRegion.Id] = currentRegion
+			d.ctx.storeMeta.regionRanges.Delete(&regionItem{prevRegion})
+			d.ctx.storeMeta.regionRanges.ReplaceOrInsert(&regionItem{currentRegion})
+			d.ctx.storeMeta.Unlock()
 		}
 		// When you are sure to apply the snapshot, you can update the peer storage’s memory state
 		// like RaftLocalState, RaftApplyState, and RegionLocalState
@@ -121,6 +135,8 @@ func (d *peerMsgHandler) processCommittedEntry(entry eraftpb.Entry, wb *engine_u
 		// fmt.Println("peerInfo: ", peerInfo)
 
 		// add region epoch check
+		log.Debugf("processCommittedEntry current peer: %v", d.peer.PeerId())
+		log.Debugf("processCommittedEntry d.Region: %v", d.Region())
 		err = util.CheckRegionEpoch(peerInfo, d.Region(), true)
 		if errEpochNotMatching, ok := err.(*util.ErrEpochNotMatch); ok {
 			if d.checkError(entry) == false {
@@ -131,11 +147,17 @@ func (d *peerMsgHandler) processCommittedEntry(entry eraftpb.Entry, wb *engine_u
 				correspondingProposal := d.proposals[0]
 				correspondingProposal.cb.Done(ErrResp(errEpochNotMatching))
 			}
+			return
 		}
 
-		d.Region().RegionEpoch.ConfVer++
 		if confChange.ChangeType == eraftpb.ConfChangeType_AddNode {
-			// todo already in peer's judge?
+			// todo already in peer's judge
+			for _, eachPeer := range d.Region().Peers {
+				if eachPeer.Id == peerInfo.AdminRequest.ChangePeer.Peer.Id {
+					return
+				}
+			}
+			d.Region().RegionEpoch.ConfVer++
 			d.Region().Peers = append(d.Region().Peers, peerInfo.AdminRequest.ChangePeer.Peer)
 			d.insertPeerCache(peerInfo.AdminRequest.ChangePeer.Peer)
 			log.Infof("processCommittedEntry addNode: %v", confChange.NodeId)
@@ -149,11 +171,13 @@ func (d *peerMsgHandler) processCommittedEntry(entry eraftpb.Entry, wb *engine_u
 			for idx, peer := range d.Region().Peers {
 				// find the node need to be removed
 				if peer.Id == confChange.NodeId {
+					d.Region().RegionEpoch.ConfVer++
 					d.Region().Peers = append(d.Region().Peers[:idx], d.Region().Peers[idx+1:]...)
+					d.removePeerCache(confChange.NodeId)
 				}
 			}
-			d.removePeerCache(confChange.NodeId)
-			log.Infof("processCommittedEntry removede: %v", confChange.NodeId)
+			log.Infof("processCommittedEntry remove node: %v", confChange.NodeId)
+			log.Infof("processCommittedEntry after remove peers: %+v", d.Region().Peers)
 		}
 		for _, peer := range d.Region().Peers {
 			log.Infof("EntryConfChange now peers: %v", peer.Id)
@@ -166,9 +190,10 @@ func (d *peerMsgHandler) processCommittedEntry(entry eraftpb.Entry, wb *engine_u
 		d.ctx.storeMeta.regions[d.regionId] = d.Region()
 		d.ctx.storeMeta.regionRanges.ReplaceOrInsert(&regionItem{region: d.Region()})
 		d.ctx.storeMeta.Unlock()
-
 		// write RegionLocalState to DB
 		meta.WriteRegionState(wb, d.Region(), rspb.PeerState_Normal)
+		wb.MustWriteToDB(d.peerStorage.Engines.Kv)
+		wb = &engine_util.WriteBatch{}
 
 		if d.checkError(entry) == false {
 			if len(d.proposals) > 0 {
@@ -185,6 +210,23 @@ func (d *peerMsgHandler) processCommittedEntry(entry eraftpb.Entry, wb *engine_u
 			}
 			correspondingProposal.cb.Done(&resp)
 		}
+		if d.RaftGroup.Raft.State == raft.StateLeader {
+			d.HeartbeatScheduler(d.ctx.schedulerTaskSender)
+		}
+	}
+}
+
+func (d *peerMsgHandler) notifyHeartbeatScheduler(region *metapb.Region, peer *peer) {
+	clonedRegion := new(metapb.Region)
+	err := util.CloneMsg(region, clonedRegion)
+	if err != nil {
+		return
+	}
+	d.ctx.schedulerTaskSender <- &runner.SchedulerRegionHeartbeatTask{
+		Region:          clonedRegion,
+		Peer:            peer.Meta,
+		PendingPeers:    peer.CollectPendingPeers(),
+		ApproximateSize: peer.ApproximateSize,
 	}
 }
 
@@ -299,13 +341,13 @@ func (d *peerMsgHandler) applyToDbAndRespond(entry eraftpb.Entry, wb *engine_uti
 
 func (d *peerMsgHandler) checkError(entry eraftpb.Entry) bool {
 	log.Debugf("check error, peer %v, entry: %v", d.peer.PeerId(), entry)
-	if len(d.proposals) > 0 {
-		// clear stale
-		for _, eachProposal := range d.proposals {
-			if eachProposal.index < entry.Index {
-				d.proposals = d.proposals[1:]
-			}
+	// clear stale
+	for _, eachProposal := range d.proposals {
+		if eachProposal.index < entry.Index {
+			d.proposals = d.proposals[1:]
 		}
+	}
+	if len(d.proposals) > 0 {
 		correspondingProposal := d.proposals[0]
 		d.printProposals(d.proposals)
 		if correspondingProposal.index == entry.Index {
@@ -333,6 +375,8 @@ func (d *peerMsgHandler) printProposals(proposals []*proposal) {
 
 // HandleMsg processes all the messages received from raftCh
 func (d *peerMsgHandler) HandleMsg(msg message.Msg) {
+	// log.Debug("peerMsgHandler peer:", d.PeerId(), "HandleMsg: ", msg)
+
 	switch msg.Type {
 	case message.MsgTypeRaftMessage:
 		raftMsg := msg.Data.(*rspb.RaftMessage) // the message transported between Raft peers.
@@ -408,6 +452,7 @@ func (d *peerMsgHandler) preProposeRaftCommand(req *raft_cmdpb.RaftCmdRequest) e
 func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
 	err := d.preProposeRaftCommand(msg)
 	if err != nil {
+		log.Debugf("preProposeRaftCommand err: %v", err)
 		cb.Done(ErrResp(err))
 		return
 	}
@@ -467,6 +512,19 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 			}
 			cb.Done(&resp)
 		case raft_cmdpb.AdminCmdType_ChangePeer:
+			// 在 propose 阶段，如果已经处于两节点，被移除的正好是 Leader，那么直接拒绝该 propose，
+			// 并且发起 Transfer Leader 到另一个节点上即可。Client 到时候会重试 remove node 指令。
+			if msg.AdminRequest.ChangePeer.Peer.Id == d.PeerId() && d.RaftGroup.Raft.State == raft.StateLeader && len(d.RaftGroup.Raft.Prs) == 2 {
+				transferee := uint64(0)
+				for pr := range d.RaftGroup.Raft.Prs {
+					if pr != msg.AdminRequest.ChangePeer.Peer.Id {
+						transferee = pr
+					}
+				}
+				d.peer.RaftGroup.TransferLeader(transferee)
+				cb.Done(ErrResp(errPeerNotFound))
+				return
+			}
 			// Propose conf change admin command by ProposeConfChange
 			prop := &proposal{
 				index: d.nextProposalIndex(),
@@ -482,12 +540,34 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 			confChange := eraftpb.ConfChange{
 				ChangeType: msg.AdminRequest.ChangePeer.ChangeType,
 				NodeId:     msg.AdminRequest.ChangePeer.Peer.Id,
-				Context:    peerInfoCtx, // todo Context's init: changePeer's info
+				Context:    peerInfoCtx, // Context's init: changePeer's info
 			}
 			err = d.RaftGroup.ProposeConfChange(confChange)
 			if err != nil {
 				log.Errorf("proposeRaftCommand err: " + err.Error())
 			}
+		case raft_cmdpb.AdminCmdType_Split:
+			// 3B addSplit
+			splitKey := msg.AdminRequest.Split.SplitKey
+			// err handle
+			keyError := util.CheckKeyInRegion(msg.AdminRequest.Split.SplitKey, d.Region())
+			if keyError != nil {
+				cb.Done(ErrResp(&util.ErrKeyNotInRegion{
+					Key:    splitKey,
+					Region: d.Region(),
+				}))
+			}
+			data, err := msg.Marshal()
+			if err != nil {
+				log.Errorf("proposeRaftCommand Split err: " + err.Error())
+				return
+			}
+			d.proposals = append(d.proposals, &proposal{
+				index: d.nextProposalIndex(),
+				term:  d.Term(),
+				cb:    cb,
+			})
+			d.RaftGroup.Propose(data)
 		default:
 		}
 	}

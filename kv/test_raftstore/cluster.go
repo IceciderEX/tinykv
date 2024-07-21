@@ -244,9 +244,16 @@ func (c *Cluster) CallCommandOnLeader(request *raft_cmdpb.RaftCmdRequest, timeou
 			if err.GetStaleCommand() != nil || err.GetEpochNotMatch() != nil || err.GetNotLeader() != nil {
 				log.Debugf("encouter retryable err %+v", resp)
 				if err.GetNotLeader() != nil && err.GetNotLeader().Leader != nil {
+					log.Debugf("CallCommandOnLeader GetNotLeader error")
 					leader = err.GetNotLeader().Leader
 				} else {
+					if err.GetStaleCommand() != nil {
+						log.Debugf("CallCommandOnLeader GetStaleCommand error")
+					} else if err.GetEpochNotMatch() != nil {
+						log.Debugf("CallCommandOnLeader GetEpochNotMatch error")
+					}
 					leader = c.LeaderOfRegion(regionID)
+					log.Debugf("CallCommandOnLeader leader change to: %v", leader)
 				}
 				continue
 			}
