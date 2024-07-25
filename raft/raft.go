@@ -166,6 +166,8 @@ type Raft struct {
 	// value.
 	// (Used in 3A conf change)
 	PendingConfIndex uint64
+	// whether this peer is sending a snapshot, not complete
+	IsSendingSnapShot bool
 }
 
 // newRaft return a raft peer with the given config
@@ -239,7 +241,7 @@ func (r *Raft) tick() {
 			if r.electionElapsed >= r.randElectionTimeout {
 				r.leadTransferee = None
 				r.electionElapsed = 0
-				r.randElectionTimeout = r.electionTimeout + rand.Intn(r.electionTimeout)
+				r.getNewElectionTick()
 			}
 		}
 	} else {
@@ -663,11 +665,7 @@ func (r *Raft) HandlePropose(m pb.Message) {
 	// fmt.Println("propose entries", r.RaftLog.entries)
 	r.Prs[r.id].Match = r.RaftLog.LastIndex()
 	r.Prs[r.id].Next = r.RaftLog.LastIndex() + 1
-	for peer := range r.Prs {
-		if peer != r.id {
-			r.sendAppend(peer)
-		}
-	}
+	r.broadcastAppend()
 	// 特殊处理一个节点的情况
 	r.maybeCommit()
 }
@@ -909,7 +907,8 @@ func (r *Raft) handleHeartbeatResponse(m pb.Message) {
 // 领导人的日志中之前的所有日志条目也都会被提交，包括由其他领导人创建的条目
 func (r *Raft) maybeCommit() {
 	// 假设存在 N 满足 N > commitIndex，使得大多数的 matchIndex[i] ≥ N以及 log[N].term == currentTerm 成立，则令 commitIndex = N
-	for i := r.RaftLog.committed + 1; i <= r.RaftLog.LastIndex(); i++ {
+	//for i := r.RaftLog.committed + 1; i <= r.RaftLog.LastIndex(); i++ {
+	for i := r.RaftLog.LastIndex(); i >= r.RaftLog.committed+1; i-- {
 		matchCount := 0 // 当前日志的复制数量
 		for peer := range r.Prs {
 			// fmt.Println(matchCount)
@@ -925,11 +924,8 @@ func (r *Raft) maybeCommit() {
 			}
 			if logTerm == r.Term {
 				r.RaftLog.committed = i
-				for peer := range r.Prs {
-					if peer != r.id {
-						r.sendAppend(peer)
-					}
-				}
+				r.broadcastAppend()
+				return
 			}
 		}
 	}
@@ -959,11 +955,13 @@ func (r *Raft) sendSnapshot(to uint64) {
 	// Raft 也包含一些少量的元数据到快照中：
 	// 最后被包含索引指的是被快照取代的最后的条目在日志中的索引值（状态机最后应用的日志），最后被包含的任期指的是该条目的任期号
 	snapshot, err := r.RaftLog.storage.Snapshot()
+	r.IsSendingSnapShot = true
 	if err != nil {
 		// ErrSnapshotTemporarilyUnavailable
 		log.Debug("sendSnapshot ErrSnapshotTemporarilyUnavailable")
 		return
 	} else {
+		r.IsSendingSnapShot = false
 		// send the snapshot message to other peers
 		msg := pb.Message{
 			MsgType:  pb.MessageType_MsgSnapshot,

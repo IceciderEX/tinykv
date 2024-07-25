@@ -152,8 +152,8 @@ func (d *storeWorker) checkMsg(msg *rspb.RaftMessage) (bool, error) {
 
 func (d *storeWorker) onRaftMessage(msg *rspb.RaftMessage) error {
 	regionID := msg.RegionId
-	log.Debugf("handle raft message. from_peer:%d, to_peer:%d, store:%d, region:%d, msg:%+v",
-		msg.FromPeer.Id, msg.ToPeer.Id, d.storeState.id, regionID, msg.Message)
+	//log.Debugf("handle raft message. from_peer:%d, to_peer:%d, store:%d, region:%d, msg:%+v",
+	//	msg.FromPeer.Id, msg.ToPeer.Id, d.storeState.id, regionID, msg.Message)
 	if err := d.ctx.router.send(regionID, message.Msg{Type: message.MsgTypeRaftMessage, Data: msg}); err == nil {
 		return nil
 	}
@@ -197,7 +197,7 @@ func (d *storeWorker) onRaftMessage(msg *rspb.RaftMessage) error {
 func (d *storeWorker) maybeCreatePeer(regionID uint64, msg *rspb.RaftMessage) (bool, error) {
 	// we may encounter a message with larger peer id, which means
 	// current peer is stale, then we should remove current peer
-	log.Infof("enter maybeCreatePeer")
+	log.Infof("enter maybeCreatePeer regionId: %v, trigger msg: %+v", regionID, msg)
 	meta := d.ctx.storeMeta
 	meta.Lock()
 	defer meta.Unlock()

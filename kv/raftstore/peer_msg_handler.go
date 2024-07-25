@@ -436,7 +436,7 @@ func (d *peerMsgHandler) applyToDbAndRespond(entry eraftpb.Entry, wb *engine_uti
 
 // checkProposalStaleError 检查Proposal是否存在已经过期的现象，如果有，回复Stale
 func (d *peerMsgHandler) checkProposalStaleError(entry eraftpb.Entry) bool {
-	log.Debugf("check error, peer %v, entry: %v", d.peer.PeerId(), entry)
+	//log.Debugf("check error, peer %v, entry: %v", d.peer.PeerId(), entry)
 	// clear stale
 	indexStaleidx := 0
 	for ; indexStaleidx < len(d.proposals) && d.proposals[indexStaleidx].index < entry.Index; indexStaleidx++ {
@@ -448,7 +448,7 @@ func (d *peerMsgHandler) checkProposalStaleError(entry eraftpb.Entry) bool {
 		// d.printProposals(d.proposals)
 		if correspondingProposal.index == entry.Index {
 			if correspondingProposal.term != entry.Term { // 可能是由于领导者更改，某些日志未提交并被新领导者的日志覆盖
-				log.Debugf("callBackProposals Term unequal")
+				//log.Debugf("callBackProposals Term unequal")
 				NotifyStaleReq(entry.Term, correspondingProposal.cb)
 				return false
 			} else {
@@ -456,10 +456,10 @@ func (d *peerMsgHandler) checkProposalStaleError(entry eraftpb.Entry) bool {
 				return true
 			}
 		}
-		log.Debugf("correspondingProposal.index != entry.Index ")
+		//log.Debugf("correspondingProposal.index != entry.Index ")
 		return false
 	}
-	log.Debugf("checkError len(d.proposals) == 0")
+	// log.Debugf("checkError len(d.proposals) == 0")
 	return false
 }
 
@@ -622,6 +622,7 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 			// 在 propose 阶段，如果已经处于两节点，被移除的正好是 Leader，那么直接拒绝该 propose，
 			// 并且发起 Transfer Leader 到另一个节点上即可。Client 到时候会重试 remove node 指令。
 			if msg.AdminRequest.ChangePeer.Peer.Id == d.PeerId() && d.RaftGroup.Raft.State == raft.StateLeader && len(d.RaftGroup.Raft.Prs) == 2 {
+				log.Debugf("ChangePeer want to remove leader, current peer: %v, all Peers: %v", d.RaftGroup.Raft.Prs, d.RaftGroup.Raft.Prs)
 				transferee := uint64(0)
 				for pr := range d.RaftGroup.Raft.Prs {
 					if pr != msg.AdminRequest.ChangePeer.Peer.Id {
@@ -629,7 +630,11 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 					}
 				}
 				d.peer.RaftGroup.TransferLeader(transferee)
-				cb.Done(ErrResp(errPeerNotFound))
+				cb.Done(ErrResp(errors.Errorf("can't remove leader when peer len < 3")))
+				return
+			}
+			if d.RaftGroup.Raft.IsSendingSnapShot {
+				cb.Done(ErrResp(errors.Errorf("can't remove leader when peer IsSendingSnapShot")))
 				return
 			}
 			// Propose conf change admin command by ProposeConfChange
@@ -643,6 +648,7 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 			if err != nil {
 				log.Errorf("proposeRaftCommand marshal err: " + err.Error())
 			}
+			log.Debugf("proposeRaftCommand changePeer propose success, msg: %v", msg)
 			fmt.Println("eraftpb.ConfChange ctx:", peerInfoCtx)
 			confChange := eraftpb.ConfChange{
 				ChangeType: msg.AdminRequest.ChangePeer.ChangeType,
@@ -675,6 +681,17 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		default:
 		}
 	}
+}
+
+func (d *peerMsgHandler) getValidPeers(msg *raft_cmdpb.RaftCmdRequest) uint64 {
+	validCount := uint64(0)
+	for each := range d.RaftGroup.Raft.Prs {
+		if d.RaftGroup.Raft.Prs[each].Match == 0 && d.RaftGroup.Raft.Prs[each].Next == 1 {
+			continue
+		}
+		validCount++
+	}
+	return validCount
 }
 
 func (d *peerMsgHandler) getRequestKey(request raft_cmdpb.Request) []byte {
@@ -799,9 +816,9 @@ func (d *peerMsgHandler) onRaftMsg(msg *rspb.RaftMessage) error {
 // return false means the message is invalid, and can be ignored.
 func (d *peerMsgHandler) validateRaftMessage(msg *rspb.RaftMessage) bool {
 	regionID := msg.GetRegionId()
-	from := msg.GetFromPeer()
+	// from := msg.GetFromPeer()
 	to := msg.GetToPeer()
-	log.Debugf("[region %d] handle raft message %s from %d to %d", regionID, msg, from.GetId(), to.GetId())
+	// log.Debugf("[region %d] handle raft message %s from %d to %d", regionID, msg, from.GetId(), to.GetId())
 	if to.GetStoreId() != d.storeID() {
 		log.Warnf("[region %d] store not match, to store id %d, mine %d, ignore it",
 			regionID, to.GetStoreId(), d.storeID())

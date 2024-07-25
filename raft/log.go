@@ -15,7 +15,7 @@
 package raft
 
 import (
-	"fmt"
+	"errors"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 	"github.com/pingcap/log"
 	"go.uber.org/zap"
@@ -103,17 +103,13 @@ func newLog(storage Storage) *RaftLog {
 // grow unlimitedly in memory
 func (l *RaftLog) maybeCompact() {
 	// Your Code Here (2C).
-	// todo further implement
-	if len(l.entries) == 0 {
-		return
-	}
 	// trunc index + 1
 	compactIndex, err := l.storage.FirstIndex()
 	if err != nil {
 		panic("maybeCompact err: " + err.Error())
 	}
 	if compactIndex > l.entryFirstIdx {
-		// compact the log entries
+		// compact the log entries to [compactIndex:]
 		if len(l.entries) > 1 {
 			l.entries = l.entries[compactIndex-l.entryFirstIdx:]
 		}
@@ -187,24 +183,21 @@ func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 func (l *RaftLog) LastIndex() uint64 {
 	// Your Code Here (2A).
 	var snapIndex uint64
+	// snapshot handle
 	if IsEmptySnap(l.pendingSnapshot) == false {
 		snapIndex = l.pendingSnapshot.Metadata.Index
 	}
 	if len(l.entries) == 0 {
-		// snapshot handle
-		//if IsEmptySnap(l.pendingSnapshot) == false {
-		//	return l.pendingSnapshot.Metadata.Index
-		//}
-		// entries为空，需要取值为storage的firstIndex-1
-		lastIdx, err := l.storage.FirstIndex()
-		log.Debug("storage last:%v\n", zap.Uint64("last", lastIdx))
+		// entries为空，需要取值为storage的lastIndex
+		storageIndex, err := l.storage.LastIndex()
+		log.Debug("storage last:%v\n", zap.Uint64("last", storageIndex))
 		if err != nil {
-			fmt.Println(fmt.Errorf(err.Error()))
-			return 0
+			panic(err)
 		} else {
-			return max(lastIdx-1, snapIndex)
+			return max(storageIndex, snapIndex)
 		}
 	} else {
+		// entry's last index
 		// fmt.Printf("entries last:%v\n", l.entries[len(l.entries)-1].Index)
 		return max(snapIndex, l.entries[len(l.entries)-1].Index)
 	}
@@ -214,37 +207,44 @@ func (l *RaftLog) LastIndex() uint64 {
 func (l *RaftLog) Term(i uint64) (uint64, error) {
 	// Your Code Here (2A).
 	// 检查索引是否在内存中的日志条目范围内。如果是，则计算内存中的索引并返回对应的条目的任期。
-	if i >= l.entryFirstIdx {
-		if i > l.LastIndex() {
-			// return 0, fmt.Errorf("RaftLog Term index out of range")
-			return 0, ErrUnavailable
-		}
+	if i >= l.entryFirstIdx && len(l.entries) > 0 {
 		entryIndex := i - l.entryFirstIdx
+		if i > l.LastIndex() {
+			panic("Term get index out of range")
+		}
 		return l.entries[entryIndex].Term, nil
 	}
-	// 否则从storage得到
+	// 否则从storage/snapshot得到
 	term, err := l.storage.Term(i)
 	if err != nil {
-		// add snapshot handle
-		if IsEmptySnap(l.pendingSnapshot) == false {
-			if i == l.pendingSnapshot.Metadata.Index {
-				return l.pendingSnapshot.Metadata.Term, nil
-			} else {
-				return 0, ErrCompacted
+		log.Debug("Term get error", zap.Error(err))
+		// 如果storage中返回ErrUnavailable，说明可能在unstable的sanpshot中
+		if errors.Is(err, ErrUnavailable) {
+			// index - offset > storage's ents
+			// add snapshot handle
+			if IsEmptySnap(l.pendingSnapshot) == false {
+				if i == l.pendingSnapshot.Metadata.Index {
+					return l.pendingSnapshot.Metadata.Term, nil
+				} else if i < l.pendingSnapshot.Metadata.Index {
+					// i < l.pendingSnapshot.Metadata.Index，在unstable的快照中
+					return term, ErrCompacted
+				}
 			}
+		} else if errors.Is(err, ErrCompacted) {
+			// index < storage's ents[0].index
+			// 不应该，返回Err
+			return term, err
 		}
-		return term, err
 	}
-	return term, nil
+	return term, err
 }
 
 // deleteFollowingTerms 删除entries中Index为from后的元素
 func (l *RaftLog) deleteFollowingEntries(from uint64) {
 	if from < l.entryFirstIdx || from-l.entryFirstIdx >= uint64(len(l.entries)) {
+		panic("deleteFollowingEntries err")
 		return
 	}
-	l.stabled = min(l.stabled, from-1) // 删除可能会影响entries的结构？
-	l.committed = min(l.committed, from-1)
-	l.applied = min(l.applied, from-1)
-	l.entries = l.entries[:from-l.entryFirstIdx]
+	l.stabled = min(l.stabled, from-1) // 删除可能会影响entries的结构
+	l.entries = l.entries[:from-l.entryFirstIdx+1]
 }
