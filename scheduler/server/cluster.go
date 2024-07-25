@@ -279,7 +279,72 @@ func (c *RaftCluster) handleStoreHeartbeat(stats *schedulerpb.StoreStats) error 
 // processRegionHeartbeat updates the region information.
 func (c *RaftCluster) processRegionHeartbeat(region *core.RegionInfo) error {
 	// Your Code Here (3C).
+	// when the Scheduler received a region heartbeat, it will update its local region information first.
+	// Then it will check whether there are pending commands for this region. If there is, it will be sent back as the response.
 
+	// Skip: One is that updates could be skipped when no changes have been made for this region
+	// 1.Check whether there is a region with the same Id in local storage.
+	localRegion, prevLeader := c.GetRegionByID(region.GetID())
+	if region.GetRegionEpoch() == nil {
+		return errors.Errorf("RegionEpoch is nil")
+	}
+	if localRegion != nil {
+		// If there is and at least one of the heartbeats’ conf_ver and version is less than its, this heartbeat region is stale
+		if region.GetRegionEpoch().Version < localRegion.RegionEpoch.Version || region.GetRegionEpoch().ConfVer < localRegion.RegionEpoch.ConfVer {
+			return errors.Errorf("this heartbeat region is stale")
+		}
+	} else {
+		// 2.If there isn’t, scan all regions that overlap with it.
+		// The heartbeats’ conf_ver and version should be greater or equal than all of them, or the region is stale.
+		overlappedRegions := c.ScanRegions(region.GetStartKey(), region.GetEndKey(), 0)
+		for _, overlappedRegion := range overlappedRegions {
+			if region.GetRegionEpoch().Version < overlappedRegion.GetRegionEpoch().Version ||
+				region.GetRegionEpoch().ConfVer < overlappedRegion.GetRegionEpoch().ConfVer {
+				return errors.Errorf("this heartbeat region is stale")
+			}
+		}
+	}
+	// Skip: one is that the Scheduler cannot trust every heartbeat
+	// (if the cluster has partitions in a certain section, the information about some nodes might be wrong)
+	// The Scheduler should use conf_ver and version to determine it, namely RegionEpoch.
+	// The Scheduler should first compare the values of the Region version of two nodes. If the values are the same,
+	// compares the values of the configuration change version. The node with a 'larger' configuration change version must have newer information.
+	skipped := true
+	localInfo := c.GetRegionInfoByKey(region.GetStartKey())
+	if localInfo != nil {
+		// 1. If the new one’s version or conf_ver is greater than the original one, it cannot be skipped
+		if region.GetRegionEpoch().Version >= localInfo.GetRegionEpoch().Version && region.GetRegionEpoch().ConfVer >= localInfo.GetRegionEpoch().ConfVer {
+			skipped = false
+		}
+		// 2. If the leader changed, it cannot be skipped
+		if prevLeader != region.GetLeader() {
+			skipped = false
+		}
+		// 3. If the new one or original one has pending peer, it cannot be skipped
+		if localInfo.GetPendingPeers() != nil || region.GetPendingPeers() != nil {
+			skipped = false
+		}
+		// 4. If the ApproximateSize changed, it cannot be skipped
+		if localInfo.GetApproximateSize() != region.GetApproximateSize() {
+			skipped = false
+		}
+	} else {
+		skipped = false
+	}
+
+	// If the Scheduler determines to update local storage according to this heartbeat,
+	// there are two things it should update: region tree and store status.
+	// You could use RaftCluster.core.PutRegion to update the region tree
+	// and use RaftCluster.core.UpdateStoreStatus to update related store’s status (such as leader count, region count, pending peer count… )
+	if !skipped {
+		err := c.putRegion(region)
+		if err != nil {
+			return err
+		}
+		for store := range region.GetStoreIds() {
+			c.updateStoreStatusLocked(store)
+		}
+	}
 	return nil
 }
 

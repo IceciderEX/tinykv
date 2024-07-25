@@ -214,6 +214,7 @@ func (c *Cluster) CallCommandOnLeader(request *raft_cmdpb.RaftCmdRequest, timeou
 	regionID := request.Header.RegionId
 	leader := c.LeaderOfRegion(regionID)
 	for {
+		log.Debugf("try to CallCommandOnLeader req: %v", request)
 		if time.Since(startTime) > timeout {
 			return nil, nil
 		}
@@ -391,6 +392,7 @@ func (c *Cluster) Scan(start, end []byte) [][]byte {
 				panic(err)
 			}
 			values = append(values, value)
+			// log.Debugf("Test Scan current key: %v, value: %v", iter.Item().Key(), string(bytes.Join(values, []byte(""))))
 		}
 		iter.Close()
 

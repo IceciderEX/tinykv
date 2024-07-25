@@ -67,6 +67,7 @@ func (s *baseScheduler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "not implements")
 }
 
+// GetMinInterval Scheduler will use the return value of GetMinInterval as the default interval to run the Schedule method periodically.
 func (s *baseScheduler) GetMinInterval() time.Duration {
 	return MinScheduleInterval
 }
