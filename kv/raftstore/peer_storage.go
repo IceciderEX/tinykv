@@ -311,6 +311,8 @@ func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.Write
 	if len(entries) == 0 {
 		return nil
 	}
+	commitLastIndex := entries[len(entries)-1].Index
+	stabledLastIndex, err := ps.LastIndex()
 	// append the given entries to the raft log
 	for _, entry := range entries {
 		key := meta.RaftLogKey(ps.region.Id, entry.Index)
@@ -323,8 +325,6 @@ func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.Write
 	ps.raftState.LastIndex = entries[len(entries)-1].Index
 	ps.raftState.LastTerm = entries[len(entries)-1].Term
 	// delete log entries that will never be committed([LastIndex, RaftLocalState.last_index])
-	commitLastIndex := entries[len(entries)-1].Index
-	stabledLastIndex, err := ps.LastIndex()
 	if err != nil {
 		log.Debug("PeerStorage Append error")
 		return err
@@ -397,20 +397,25 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 	// Your Code Here (2B/2C).
 	// append log entries
 	wb := &engine_util.WriteBatch{}
-	err := ps.Append(ready.Entries, wb)
-	if err != nil {
-		return nil, err
-	}
 	kvWB := &engine_util.WriteBatch{}
 	result := &ApplySnapResult{}
+	var err error
 	if raft.IsEmptySnap(&ready.Snapshot) == false {
-		fmt.Println("apply snapshot %v", ready.Snapshot)
+		fmt.Println("SaveReadyState apply snapshot", ready.Snapshot)
 		result, err = ps.ApplySnapshot(&ready.Snapshot, kvWB, wb)
 		if err != nil {
+			panic(err)
 			return nil, err
 		}
 		kvWB.MustWriteToDB(ps.Engines.Kv)
+		wb.MustWriteToDB(ps.Engines.Raft) // maybe reason
 	}
+	wb = &engine_util.WriteBatch{}
+	err = ps.Append(ready.Entries, wb)
+	if err != nil {
+		return nil, err
+	}
+	log.Debugf("peer after SaveReadyState append/snapshot's lastIndex: %v", ps.raftState.LastIndex)
 	// save the Raft hard state
 	if !raft.IsEmptyHardState(ready.HardState) {
 		ps.raftState.HardState = &ready.HardState

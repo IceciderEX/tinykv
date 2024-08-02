@@ -16,6 +16,7 @@ package raft
 
 import (
 	"errors"
+	log2 "github.com/pingcap-incubator/tinykv/log"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 	"github.com/pingcap/log"
 	"go.uber.org/zap"
@@ -91,10 +92,8 @@ func newLog(storage Storage) *RaftLog {
 	// entryFirstIdx: entries数组第一个entry的Index
 	nLog.entryFirstIdx = firstIdx
 	// get all entries that have not yet compact, 初始化为storage中已经持久化的entry
-	nLog.entries, err = storage.Entries(firstIdx, lastIdx+1)
-	if err != nil {
-		panic(err.Error())
-	}
+	nLog.entries, _ = storage.Entries(firstIdx, lastIdx+1)
+	log2.Debugf("committed %d, applied %d, lastIndex: %v, nLog.entryFirstIdx:%v", nLog.committed, nLog.applied, nLog.stabled, nLog.entryFirstIdx)
 	return nLog
 }
 
@@ -135,7 +134,11 @@ func (l *RaftLog) allEntries() []pb.Entry {
 func (r *RaftLog) getPartEntries(begin, end uint64) []pb.Entry {
 	// log.Debug("getPartEntries", zap.Uint64("begin", begin), zap.Uint64("end", end))
 	// fmt.Println("getPartEntries", begin, " ", end, " ", r.entryFirstIdx)
-	return r.entries[begin-r.entryFirstIdx : end-r.entryFirstIdx]
+	if begin-r.entryFirstIdx >= 0 && end-r.entryFirstIdx <= uint64(len(r.entries)) {
+		return r.entries[begin-r.entryFirstIdx : end-r.entryFirstIdx]
+	} else {
+		return nil
+	}
 }
 
 // unstableEntries return all the unstable entries
@@ -147,7 +150,7 @@ func (l *RaftLog) unstableEntries() []pb.Entry {
 		return nil
 	} else {
 		// fmt.Println(l.stabled, " ", l.LastIndex())
-		if l.stabled >= l.entryFirstIdx-1 {
+		if l.stabled >= l.entryFirstIdx-1 && l.stabled-l.entryFirstIdx+1 < uint64(len(l.entries)) {
 			return l.entries[l.stabled-l.entryFirstIdx+1:]
 		} else {
 			return nil
@@ -174,6 +177,9 @@ func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	// Your Code Here (2A).
 	// all the committed but not applied entries: [l.applied + 1:l.committed + 1] ?
 	if len(l.entries) == 0 {
+		return nil
+	}
+	if l.applied > l.committed {
 		return nil
 	}
 	return l.getPartEntries(l.applied+1, l.committed+1)
@@ -209,6 +215,10 @@ func (l *RaftLog) Term(i uint64) (uint64, error) {
 	// 检查索引是否在内存中的日志条目范围内。如果是，则计算内存中的索引并返回对应的条目的任期。
 	if i >= l.entryFirstIdx && len(l.entries) > 0 {
 		entryIndex := i - l.entryFirstIdx
+		// 3b add boundary check
+		if entryIndex >= uint64(len(l.entries)) {
+			return 0, ErrUnavailable
+		}
 		if i > l.LastIndex() {
 			panic("Term get index out of range")
 		}

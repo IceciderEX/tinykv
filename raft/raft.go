@@ -249,7 +249,9 @@ func (r *Raft) tick() {
 		if r.electionElapsed >= r.randElectionTimeout {
 			// fmt.Printf("election time:%v - %v\n", r.electionElapsed, r.randElectionTimeout)
 			r.electionElapsed = 0
-			r.startCampaign()
+			if len(r.Prs) > 0 {
+				r.startCampaign()
+			}
 		}
 	}
 }
@@ -342,6 +344,7 @@ func (r *Raft) handleRequestVote(message pb.Message) {
 
 // follower发送投票的应答
 func (r *Raft) sendRequestVoteResponse(candidateId uint64, reject bool) {
+	log.Debugf("peer %v send Vote Response, reject: %v, curTerm: %v", r.id, reject, r.Term)
 	msg := pb.Message{
 		MsgType: pb.MessageType_MsgRequestVoteResponse,
 		Term:    r.Term,
@@ -385,6 +388,7 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 
 // sendHeartbeatResponse follower 发送heartbeat的response
 func (r *Raft) sendHeartbeatResponse(to uint64, reject bool) {
+	log.Debugf("peer %v send Heartbeat Response, reject: %v, curTerm: %v", r.id, reject, r.Term)
 	msg := pb.Message{
 		MsgType: pb.MessageType_MsgHeartbeatResponse,
 		Term:    r.Term,
@@ -737,7 +741,6 @@ func (r *Raft) sendAppend(to uint64) bool {
 // 如果跟随者在它的日志中找不到包含相同索引位置和任期号的条目，那么他就会拒绝接收新的日志条目...
 func (r *Raft) handleAppendEntries(message pb.Message) {
 	// Your Code Here (2A).
-	// todo 图展示
 	prevLogIndex := message.Index
 	prevLogTerm := message.LogTerm
 	leaderTerm := message.Term
@@ -824,7 +827,7 @@ func (r *Raft) sendAppendResponse(to uint64, reject bool, index uint64) {
 		From:    r.id,
 		// 日志索引ID，用于节点向leader汇报自己保存的最大日志数据Index
 		// 最新匹配的 index??????
-		Index:  index, // todo 不同情景下的回复不同
+		Index:  index, // 不同情景下的回复不同
 		Term:   r.Term,
 		Reject: reject,
 	}
@@ -837,6 +840,9 @@ func (r *Raft) handleAppendResponse(message pb.Message) {
 	if message.Term > r.Term {
 		r.becomeFollower(message.Term, None)
 		return
+	}
+	if message.Commit == 1 {
+		r.IsSendingSnapShot = false
 	}
 
 	if message.Reject == false { // 响应同步成功
@@ -961,8 +967,8 @@ func (r *Raft) sendSnapshot(to uint64) {
 		log.Debug("sendSnapshot ErrSnapshotTemporarilyUnavailable")
 		return
 	} else {
-		r.IsSendingSnapShot = false
 		// send the snapshot message to other peers
+		log.Debug("sendSnapshot to ", to)
 		msg := pb.Message{
 			MsgType:  pb.MessageType_MsgSnapshot,
 			From:     r.id,
@@ -992,6 +998,7 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 		r.sendSnapResponse(m.From, false, r.RaftLog.committed)
 		return
 	}
+	log.Debugf("peer %v received a snapshot", r.id)
 
 	// 通常快照会包含没有在接收者日志中存在的信息。在这种情况下，跟随者丢弃其整个日志；它全部被快照取代，并且可能包含与快照冲突的未提交条目。
 	// 如果接收到的快照是自己日志的前面部分（由于网络重传或者错误），那么被快照包含的条目将会被全部删除，但是快照后面的条目仍然有效，必须保留
@@ -1022,6 +1029,7 @@ func (r *Raft) sendSnapResponse(to uint64, reject bool, index uint64) {
 		Term:    r.Term,
 		Reject:  reject,
 		Index:   index,
+		Commit:  1, // just for snapshot apply check
 	}
 	log.Debugf("peer send SnapResponse msg : %+v", msg)
 	r.msgs = append(r.msgs, msg)

@@ -16,9 +16,7 @@ package raft
 
 import (
 	"errors"
-	"github.com/pingcap/log"
-	"go.uber.org/zap"
-
+	log2 "github.com/pingcap-incubator/tinykv/log"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
 
@@ -244,10 +242,11 @@ func (rn *RawNode) HasReady() bool {
 func (rn *RawNode) Advance(rd Ready) {
 	// Your Code Here (2A).
 	if len(rd.CommittedEntries) > 0 {
-		log.Debug("RawNode Advance applied to", zap.Uint64("index", rd.CommittedEntries[len(rd.CommittedEntries)-1].Index))
+		log2.Debugf("RawNode %v Advance applied to: %v", rn.Raft.id, rd.CommittedEntries[len(rd.CommittedEntries)-1].Index)
 		rn.Raft.RaftLog.applied = rd.CommittedEntries[len(rd.CommittedEntries)-1].Index
 	}
 	if len(rd.Entries) > 0 {
+		log2.Debugf("RawNode %v Advance stabled to: %v", rn.Raft.id, rd.Entries[len(rd.Entries)-1].Index)
 		rn.Raft.RaftLog.stabled = rd.Entries[len(rd.Entries)-1].Index
 	}
 	if IsEmptyHardState(rd.HardState) == false {

@@ -269,6 +269,7 @@ func (p *peer) Send(trans Transport, msgs []eraftpb.Message) {
 		err := p.sendRaftMessage(msg, trans)
 		if err != nil {
 			log.Debugf("%v send message err: %v", p.Tag, err)
+			//log.Debugf("%v send message err, msgType: %v", p.Tag, msg.MsgType)
 		}
 	}
 }
@@ -386,7 +387,7 @@ func (p *peer) sendRaftMessage(msg eraftpb.Message, trans Transport) error {
 	if p.peerStorage.isInitialized() && util.IsInitialMsg(&msg) {
 		sendMsg.StartKey = append([]byte{}, p.Region().StartKey...)
 		sendMsg.EndKey = append([]byte{}, p.Region().EndKey...)
-		log.Debugf("sendRaftMessage, isInitial startKey: %v , endKey: %v", sendMsg.StartKey, sendMsg.EndKey)
+		// log.Debugf("sendRaftMessage, isInitial startKey: %v , endKey: %v", sendMsg.StartKey, sendMsg.EndKey)
 	}
 	sendMsg.Message = &msg
 	return trans.Send(sendMsg)
