@@ -366,9 +366,6 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 	}
 	// 否则变为follower
 	r.becomeFollower(m.Term, m.From)
-	// 更新tick
-	r.heartbeatElapsed = 0
-	r.electionElapsed = 0
 	// Reply false if log doesn’t contain an entry at prevLogIndex
 	// whose term matches prevLogTerm
 	term, err := r.RaftLog.Term(m.Index)
@@ -538,7 +535,6 @@ func (r *Raft) Step(m pb.Message) error {
 func (r *Raft) stepForFollower(m pb.Message) {
 	switch m.MsgType {
 	case pb.MessageType_MsgHup: // 发起一次选举
-		// todo 要先判断自身的条件是否满足选举条件
 		if r.RaftLog.pendingSnapshot == nil {
 			r.startCampaign()
 		}
@@ -762,7 +758,8 @@ func (r *Raft) handleAppendEntries(message pb.Message) {
 		term, err := r.RaftLog.Term(prevLogIndex)
 		if err != nil {
 			fmt.Println("handleAppendEntries err:", fmt.Errorf(err.Error()))
-			panic(err)
+			r.sendAppendResponse(message.From, true, prevLogIndex)
+			return
 		}
 		if term != prevLogTerm { // 不存在prevLogIndex 以及 prevLogTerm 一样的索引和任期的日志条目
 			r.sendAppendResponse(message.From, true, prevLogIndex)
@@ -794,9 +791,14 @@ func (r *Raft) handleAppendEntries(message pb.Message) {
 				if receiveEntryTerm != logEntryTerm {
 					if int(entry.Index-r.RaftLog.entryFirstIdx) >= 0 {
 						//fmt.Println("handleAppendEntries recvTerm:", receiveEntryTerm, " logEntryTerm:", logEntryTerm)
-						r.RaftLog.entries[entry.Index-r.RaftLog.entryFirstIdx] = *entry
+						//r.RaftLog.entries[entry.Index-r.RaftLog.entryFirstIdx] = *entry
 						// 删除这个已经存在的条目以及它之后的所有条目
 						r.RaftLog.deleteFollowingEntries(entry.Index)
+						// 再复制后面的日志
+						for replicaIdx := idx; replicaIdx < len(message.Entries); replicaIdx++ {
+							r.RaftLog.entries = append(r.RaftLog.entries, *message.Entries[replicaIdx])
+						}
+						break
 					}
 				}
 			}

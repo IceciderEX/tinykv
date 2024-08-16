@@ -150,7 +150,7 @@ func (l *RaftLog) unstableEntries() []pb.Entry {
 		return nil
 	} else {
 		// fmt.Println(l.stabled, " ", l.LastIndex())
-		if l.stabled >= l.entryFirstIdx-1 && l.stabled-l.entryFirstIdx+1 < uint64(len(l.entries)) {
+		if l.stabled >= l.entryFirstIdx-1 && l.stabled-l.entryFirstIdx+1 <= uint64(len(l.entries)) {
 			return l.entries[l.stabled-l.entryFirstIdx+1:]
 		} else {
 			return nil
@@ -249,12 +249,11 @@ func (l *RaftLog) Term(i uint64) (uint64, error) {
 	return term, err
 }
 
-// deleteFollowingTerms 删除entries中Index为from后的元素
+// deleteFollowingTerms 删除entries中Index为from后的元素(包括from）
 func (l *RaftLog) deleteFollowingEntries(from uint64) {
-	if from < l.entryFirstIdx || from-l.entryFirstIdx >= uint64(len(l.entries)) {
-		panic("deleteFollowingEntries err")
+	if from-l.entryFirstIdx < 0 || from-l.entryFirstIdx >= uint64(len(l.entries)) {
 		return
 	}
 	l.stabled = min(l.stabled, from-1) // 删除可能会影响entries的结构
-	l.entries = l.entries[:from-l.entryFirstIdx+1]
+	l.entries = l.entries[:from-l.entryFirstIdx]
 }

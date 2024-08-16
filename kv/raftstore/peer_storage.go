@@ -311,8 +311,17 @@ func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.Write
 	if len(entries) == 0 {
 		return nil
 	}
+	firstIndex, _ := ps.FirstIndex()
 	commitLastIndex := entries[len(entries)-1].Index
 	stabledLastIndex, err := ps.LastIndex()
+	// bug fix appliedIndex > lastIndex ?
+	if commitLastIndex < firstIndex {
+		return nil
+	}
+	if entries[0].Index < firstIndex {
+		entries = entries[firstIndex-entries[0].Index:]
+	}
+
 	// append the given entries to the raft log
 	for _, entry := range entries {
 		key := meta.RaftLogKey(ps.region.Id, entry.Index)
@@ -321,9 +330,6 @@ func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.Write
 			return err
 		}
 	}
-	// update ps.raftState
-	ps.raftState.LastIndex = entries[len(entries)-1].Index
-	ps.raftState.LastTerm = entries[len(entries)-1].Term
 	// delete log entries that will never be committed([LastIndex, RaftLocalState.last_index])
 	if err != nil {
 		log.Debug("PeerStorage Append error")
@@ -335,6 +341,9 @@ func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.Write
 			raftWB.DeleteMeta(key)
 		}
 	}
+	// update ps.raftState
+	ps.raftState.LastIndex = entries[len(entries)-1].Index
+	ps.raftState.LastTerm = entries[len(entries)-1].Term
 	return nil
 }
 

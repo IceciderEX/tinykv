@@ -286,7 +286,7 @@ func (c *RaftCluster) processRegionHeartbeat(region *core.RegionInfo) error {
 	// 1.Check whether there is a region with the same Id in local storage.
 	localRegion, prevLeader := c.GetRegionByID(region.GetID())
 	if region.GetRegionEpoch() == nil {
-		return errors.Errorf("RegionEpoch is nil")
+		return nil
 	}
 	if localRegion != nil {
 		// If there is and at least one of the heartbeats’ conf_ver and version is less than its, this heartbeat region is stale

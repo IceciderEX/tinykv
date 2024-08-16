@@ -62,8 +62,8 @@ func (d *peerMsgHandler) HandleRaftReady() {
 			fmt.Println("HandleRaftReady SaveReadyState error", fmt.Errorf(err.Error()))
 			return
 		}
-		// 要应用的快照可能与现有区域的范围重叠。检查逻辑在 checkSnapshot() 中。在实施和处理这种情况时，请牢记这一点。
-		// region update: snapshot's region apply
+		// weekly meeting add
+		// region update: snapshot's region apply result to newly-created nodes
 		if snapShotResult != nil && !reflect.DeepEqual(snapShotResult.PrevRegion, snapShotResult.Region) {
 			currentRegion := snapShotResult.Region
 			prevRegion := snapShotResult.PrevRegion
@@ -182,12 +182,13 @@ func (d *peerMsgHandler) processCommittedEntry(entry eraftpb.Entry, wb *engine_u
 			// For executing RemoveNode, you should call the destroyPeer()
 			// explicitly to stop the Raft module. The destroy logic is provided for you.
 			if confChange.NodeId == d.peer.PeerId() {
-				d.destroyPeer()
+				d.myDestroyPeer()
+				// d.destroyPeer()
 				return
 			}
-			for idx, peer := range prevRegion.Peers {
+			for idx, peerID := range prevRegion.Peers {
 				// find the node need to be removed
-				if peer.Id == confChange.NodeId {
+				if peerID.Id == confChange.NodeId {
 					prevRegion.RegionEpoch.ConfVer++
 					prevRegion.Peers = append(prevRegion.Peers[:idx], prevRegion.Peers[idx+1:]...)
 					// Do not forget to update the region state in storeMeta of GlobalContext
@@ -217,6 +218,29 @@ func (d *peerMsgHandler) processCommittedEntry(entry eraftpb.Entry, wb *engine_u
 	}
 }
 
+func (d *peerMsgHandler) myDestroyPeer() {
+	if d.RaftGroup.Raft.State == raft.StateLeader && len(d.Region().Peers) == 2 {
+		another := uint64(0)
+		for _, eachPeer := range d.Region().Peers {
+			if eachPeer.Id != d.PeerId() {
+				another = eachPeer.Id
+				break
+			}
+		}
+
+		heartBeatMsg := []eraftpb.Message{{
+			To:      another,
+			MsgType: eraftpb.MessageType_MsgHeartbeat,
+			Commit:  d.peerStorage.raftState.HardState.Commit,
+		}}
+		for i := 0; i < 10; i++ {
+			d.Send(d.ctx.trans, heartBeatMsg)
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+	d.destroyPeer()
+}
+
 // proposalResponse
 func (d *peerMsgHandler) proposalAdminResponse(entry eraftpb.Entry, cmdType raft_cmdpb.AdminCmdType) {
 	if d.checkProposalStaleError(entry) == false {
@@ -234,20 +258,6 @@ func (d *peerMsgHandler) proposalAdminResponse(entry eraftpb.Entry, cmdType raft
 		}
 		correspondingProposal.cb.Done(&resp)
 		d.proposals = d.proposals[1:]
-	}
-}
-
-func (d *peerMsgHandler) notifyHeartbeatScheduler(region *metapb.Region, peer *peer) {
-	clonedRegion := new(metapb.Region)
-	err := util.CloneMsg(region, clonedRegion)
-	if err != nil {
-		return
-	}
-	d.ctx.schedulerTaskSender <- &runner.SchedulerRegionHeartbeatTask{
-		Region:          clonedRegion,
-		Peer:            peer.Meta,
-		PendingPeers:    peer.CollectPendingPeers(),
-		ApproximateSize: peer.ApproximateSize,
 	}
 }
 
@@ -417,8 +427,7 @@ func (d *peerMsgHandler) applyToDbAndRespond(entry eraftpb.Entry, wb *engine_uti
 			// To make sure the ids of the newly created Region and Peers are unique,
 			// the ids are allocated by the scheduler. It’s also provided, so you don’t have to implement it
 			newRegionPeers := make([]*metapb.Peer, 0)
-			// 在创建 peer 的时候你可能会遇到 split request 中的 NewPeerIds 和你当前 region peers 数量不一致的问题，
-			// 我这里是在 apply 之前做了一个判断，如果两者长度不相同，直接拒绝本次 split request
+			// NewPeerIds 和 region peers 数量需要一致
 			if len(splitReq.NewPeerIds) != len(prevRegion.Peers) {
 				if d.checkProposalStaleError(entry) == false {
 					if len(d.proposals) > 0 {
@@ -478,9 +487,9 @@ func (d *peerMsgHandler) applyToDbAndRespond(entry eraftpb.Entry, wb *engine_uti
 				Type: message.MsgTypeStart,
 			})
 
-			// notifyHeartbeatScheduler
-			d.notifyHeartbeatScheduler(newRegion, newPeer)
-			d.notifyHeartbeatScheduler(prevRegion, d.peer)
+			// send Region heartbeat to scheduler
+			d.heartbeatSchedulerForSplit(newRegion, newPeer)
+			d.heartbeatSchedulerForSplit(prevRegion, d.peer)
 			// respond
 			if d.checkProposalStaleError(entry) == false {
 				if len(d.proposals) > 0 {
@@ -503,6 +512,20 @@ func (d *peerMsgHandler) applyToDbAndRespond(entry eraftpb.Entry, wb *engine_uti
 			}
 		default:
 		}
+	}
+}
+
+func (d *peerMsgHandler) heartbeatSchedulerForSplit(region *metapb.Region, peer *peer) {
+	clonedRegion := new(metapb.Region)
+	err := util.CloneMsg(region, clonedRegion)
+	if err != nil {
+		return
+	}
+	d.ctx.schedulerTaskSender <- &runner.SchedulerRegionHeartbeatTask{
+		Region:          clonedRegion,
+		Peer:            peer.Meta,
+		PendingPeers:    peer.CollectPendingPeers(),
+		ApproximateSize: peer.ApproximateSize,
 	}
 }
 

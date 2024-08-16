@@ -46,7 +46,7 @@ type StandAloneReader struct {
 }
 
 func (reader *StandAloneReader) GetCF(cf string, key []byte) ([]byte, error) {
-	// 直接调用engine utils里面的api接口即可
+	// 直接调用engine utils里面的API接口即可
 	val, err := engine_util.GetCFFromTxn(reader.txn, cf, key)
 	if err != nil {
 		if errors.Is(err, badger.ErrKeyNotFound) {
