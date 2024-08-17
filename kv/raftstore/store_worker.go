@@ -197,7 +197,7 @@ func (d *storeWorker) onRaftMessage(msg *rspb.RaftMessage) error {
 func (d *storeWorker) maybeCreatePeer(regionID uint64, msg *rspb.RaftMessage) (bool, error) {
 	// we may encounter a message with larger peer id, which means
 	// current peer is stale, then we should remove current peer
-	log.Infof("enter maybeCreatePeer regionId: %v, trigger msg: %+v", regionID, msg)
+	log.Infof("enter maybeCreatePeer regionId: %v, trigger msgType: %v, from: %v, to: %v, entsLen:%v", regionID, msg.Message.MsgType, msg.FromPeer, msg.ToPeer, len(msg.Message.Entries))
 	meta := d.ctx.storeMeta
 	meta.Lock()
 	defer meta.Unlock()

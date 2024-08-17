@@ -4,6 +4,7 @@ import (
 	"github.com/Connor1996/badger"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/util"
 	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
+	"github.com/pingcap-incubator/tinykv/log"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/metapb"
 )
 
@@ -80,6 +81,7 @@ func (it *RegionIterator) Next() {
 
 func (it *RegionIterator) Seek(key []byte) {
 	if err := util.CheckKeyInRegion(key, it.region); err != nil {
+		log.Debug("panic key: ", key, ", region: ", it.region, " error: ", err)
 		panic(err)
 	}
 	it.iter.Seek(key)
