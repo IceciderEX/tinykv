@@ -86,26 +86,26 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		// applying committed entries
 		// apply the committed entries and update the applied index in one write batch
 		// 即为经过Raft节点Commit之后，需要apply的日志（里面存放着Request）
-		wb := &engine_util.WriteBatch{}
-		for _, entry := range ready.CommittedEntries {
-			// process entry
-			// applies the committed entry to the state machine
-			d.processCommittedEntry(entry, wb)
-			// 3B add destroy peer
-			if d.stopped {
-				return
-			}
-		}
 		// applied index update -> kv's applyState
 		if len(ready.CommittedEntries) > 0 {
+			wb := &engine_util.WriteBatch{}
+			for _, entry := range ready.CommittedEntries {
+				// process entry
+				// applies the committed entry to the state machine
+				wb = d.processCommittedEntry(entry, wb)
+				// 3B add destroy peer
+				if d.stopped {
+					return
+				}
+			}
 			log.Debug("HandleRaftReady committed len: %v", len(ready.CommittedEntries))
 			d.peerStorage.applyState.AppliedIndex = ready.CommittedEntries[len(ready.CommittedEntries)-1].Index
-			err = wb.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
+			wb.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
 			log.Debugf("HandleRaftReady applied index to: %v", d.peerStorage.applyState.AppliedIndex)
 			if err != nil {
 				log.Error("HandleRaftReady's setMeta error", fmt.Errorf(err.Error()))
 			}
-			wb.MustWriteToDB(d.peerStorage.Engines.Kv)
+			wb.WriteToDB(d.peerStorage.Engines.Kv)
 		}
 		// advance rd
 		d.RaftGroup.Advance(ready)
@@ -117,9 +117,9 @@ func (d *peerMsgHandler) HandleRaftReady() {
 // 每执行完一次 apply，都需要对 proposals 中的相应Index的proposal进行 callback 回应（调用 cb.Done()），
 // 表示这条命令已经完成了（如果是Get命令还会返回取到的value），然后从中删除这个proposal
 // 就是把entry中的操作拿给kvDB去实际执行（例如put、delete某个数据）
-func (d *peerMsgHandler) processCommittedEntry(entry eraftpb.Entry, wb *engine_util.WriteBatch) {
+func (d *peerMsgHandler) processCommittedEntry(entry eraftpb.Entry, wb *engine_util.WriteBatch) *engine_util.WriteBatch {
 	if entry.EntryType == eraftpb.EntryType_EntryNormal {
-		d.applyToDbAndRespond(entry, wb)
+		wb = d.applyToDbAndRespond(entry, wb)
 		// wb.WriteToDB(d.peerStorage.Engines.Kv)
 	} else if entry.EntryType == eraftpb.EntryType_EntryConfChange {
 		// 测试代码会多次调度一个 conf 更改的命令，直到应用 conf 更改，因此您需要考虑如何忽略同一 conf 更改的重复命令。
@@ -147,7 +147,7 @@ func (d *peerMsgHandler) processCommittedEntry(entry eraftpb.Entry, wb *engine_u
 				correspondingProposal.cb.Done(ErrResp(errNotMatch))
 				d.proposals = d.proposals[1:]
 			}
-			return
+			return wb
 		}
 
 		// add region epoch check
@@ -184,7 +184,7 @@ func (d *peerMsgHandler) processCommittedEntry(entry eraftpb.Entry, wb *engine_u
 			if confChange.NodeId == d.peer.PeerId() {
 				d.myDestroyPeer()
 				// d.destroyPeer()
-				return
+				return wb
 			}
 			for idx, peerID := range prevRegion.Peers {
 				// find the node need to be removed
@@ -216,6 +216,7 @@ func (d *peerMsgHandler) processCommittedEntry(entry eraftpb.Entry, wb *engine_u
 		}
 		log.Infof("processCommittedEntry all Done: %v", d.peer.PeerId())
 	}
+	return wb
 }
 
 func (d *peerMsgHandler) myDestroyPeer() {
@@ -262,7 +263,7 @@ func (d *peerMsgHandler) proposalAdminResponse(entry eraftpb.Entry, cmdType raft
 }
 
 // applyToDB EntryNormal类型，执行entry解码出来的Requests中的4种操作，并响应Proposal
-func (d *peerMsgHandler) applyToDbAndRespond(entry eraftpb.Entry, wb *engine_util.WriteBatch) {
+func (d *peerMsgHandler) applyToDbAndRespond(entry eraftpb.Entry, wb *engine_util.WriteBatch) *engine_util.WriteBatch {
 	msg := &raft_cmdpb.RaftCmdRequest{}
 	err := msg.Unmarshal(entry.Data)
 	if err != nil {
@@ -275,6 +276,7 @@ func (d *peerMsgHandler) applyToDbAndRespond(entry eraftpb.Entry, wb *engine_uti
 		Responses: []*raft_cmdpb.Response{},
 	}
 	err = util.CheckRegionEpoch(msg, d.Region(), true)
+	var correspondingProposal *proposal
 	if errEpochNotMatching, ok := err.(*util.ErrEpochNotMatch); ok {
 		if d.checkProposalStaleError(entry) == false {
 			// error
@@ -282,16 +284,34 @@ func (d *peerMsgHandler) applyToDbAndRespond(entry eraftpb.Entry, wb *engine_uti
 				d.proposals = d.proposals[1:]
 			}
 		} else {
-			correspondingProposal := d.proposals[0]
+			correspondingProposal = d.proposals[0]
 			correspondingProposal.cb.Done(ErrResp(errEpochNotMatching))
 			d.proposals = d.proposals[1:]
 		}
-		return
+		return wb
 	}
 
 	// normal requests(4 basic Op)
 	if len(msg.Requests) > 0 {
-		var correspondingProposal *proposal
+		for _, eachRequest := range msg.Requests {
+			key := d.getRequestKey(*eachRequest)
+			if key != nil {
+				err = util.CheckKeyInRegion(key, d.Region())
+				if err != nil {
+					if d.checkProposalStaleError(entry) == false {
+						// error
+						if len(d.proposals) > 0 {
+							d.proposals = d.proposals[1:]
+						}
+					} else {
+						correspondingProposal = d.proposals[0]
+						correspondingProposal.cb.Done(ErrResp(err))
+						d.proposals = d.proposals[1:]
+					}
+					return wb
+				}
+			}
+		}
 		for _, request := range msg.Requests {
 			// 如果是Put或者Delete，把entry中的操作拿给kvDB去实际执行
 			switch request.CmdType {
@@ -324,6 +344,10 @@ func (d *peerMsgHandler) applyToDbAndRespond(entry eraftpb.Entry, wb *engine_uti
 				case raft_cmdpb.CmdType_Get:
 					// fmt.Println("applyToDB Get op", request.Get.GetCf(), string(request.Get.GetKey()))
 					// Get操作需要返回value
+					d.peerStorage.applyState.AppliedIndex = entry.Index
+					wb.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
+					wb.WriteToDB(d.peerStorage.Engines.Kv)
+					wb = &engine_util.WriteBatch{}
 					val, err := engine_util.GetCF(d.peerStorage.Engines.Kv, request.Get.GetCf(), request.Get.GetKey())
 					if err != nil {
 						fmt.Println("HandleRaftReady's get error", fmt.Errorf(err.Error()))
@@ -348,6 +372,10 @@ func (d *peerMsgHandler) applyToDbAndRespond(entry eraftpb.Entry, wb *engine_uti
 					// Scan -> Request -> CallCommandInStore -> here
 					// need resp, cb.Txn
 					// recover debug
+					d.peerStorage.applyState.AppliedIndex = entry.Index
+					wb.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
+					wb.WriteToDB(d.peerStorage.Engines.Kv)
+					wb = &engine_util.WriteBatch{}
 					region := new(metapb.Region)
 					err = util.CloneMsg(d.Region(), region)
 					if err != nil {
@@ -400,11 +428,11 @@ func (d *peerMsgHandler) applyToDbAndRespond(entry eraftpb.Entry, wb *engine_uti
 						d.proposals = d.proposals[1:]
 					}
 				} else {
-					correspondingProposal := d.proposals[0]
+					correspondingProposal = d.proposals[0]
 					correspondingProposal.cb.Done(ErrResp(errEpochNotMatching))
 					d.proposals = d.proposals[1:]
 				}
-				return
+				return wb
 			}
 			splitReq := msg.AdminRequest.Split
 			if err = util.CheckKeyInRegion(splitReq.SplitKey, d.Region()); err != nil {
@@ -413,11 +441,11 @@ func (d *peerMsgHandler) applyToDbAndRespond(entry eraftpb.Entry, wb *engine_uti
 						d.proposals = d.proposals[1:]
 					}
 				} else {
-					correspondingProposal := d.proposals[0]
+					correspondingProposal = d.proposals[0]
 					correspondingProposal.cb.Done(ErrResp(err))
 					d.proposals = d.proposals[1:]
 				}
-				return
+				return wb
 			}
 			log.Debug("apply split operation check success")
 			prevRegion := d.Region()
@@ -434,11 +462,11 @@ func (d *peerMsgHandler) applyToDbAndRespond(entry eraftpb.Entry, wb *engine_uti
 						d.proposals = d.proposals[1:]
 					}
 				} else {
-					correspondingProposal := d.proposals[0]
+					correspondingProposal = d.proposals[0]
 					correspondingProposal.cb.Done(ErrResp(errors.Errorf("newPeerId len not right!")))
 					d.proposals = d.proposals[1:]
 				}
-				return
+				return wb
 			}
 			for idx, prevPeer := range prevRegion.Peers {
 				newRegionPeers = append(newRegionPeers, &metapb.Peer{
@@ -475,6 +503,8 @@ func (d *peerMsgHandler) applyToDbAndRespond(entry eraftpb.Entry, wb *engine_uti
 			meta.WriteRegionState(wb, newRegion, rspb.PeerState_Normal)
 			d.SizeDiffHint = 0
 			d.ApproximateSize = new(uint64)
+			wb.WriteToDB(d.peerStorage.Engines.Kv)
+			wb = &engine_util.WriteBatch{}
 
 			// The corresponding Peer of this newly-created Region should be created by createPeer() and registered to the router.regions.
 			newPeer, err := createPeer(d.ctx.store.Id, d.ctx.cfg, d.ctx.regionTaskSender, d.ctx.engine, newRegion)
@@ -506,13 +536,14 @@ func (d *peerMsgHandler) applyToDbAndRespond(entry eraftpb.Entry, wb *engine_uti
 						},
 					},
 				}
-				correspondingProposal := d.proposals[0]
+				correspondingProposal = d.proposals[0]
 				correspondingProposal.cb.Done(resp)
 				d.proposals = d.proposals[1:]
 			}
 		default:
 		}
 	}
+	return wb
 }
 
 func (d *peerMsgHandler) heartbeatSchedulerForSplit(region *metapb.Region, peer *peer) {

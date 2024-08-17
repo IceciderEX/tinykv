@@ -417,9 +417,8 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 			return nil, err
 		}
 		kvWB.MustWriteToDB(ps.Engines.Kv)
-		wb.MustWriteToDB(ps.Engines.Raft) // maybe reason
+		// wb.MustWriteToDB(ps.Engines.Raft) // maybe reason
 	}
-	wb = &engine_util.WriteBatch{}
 	err = ps.Append(ready.Entries, wb)
 	if err != nil {
 		return nil, err
